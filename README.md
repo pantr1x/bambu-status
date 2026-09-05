@@ -31,7 +31,7 @@ the serial prefix.
 ## Install
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/bambu-status.git
+git clone https://github.com/pantr1x/bambu-status.git
 cd bambu-status
 ./install.sh
 ```
