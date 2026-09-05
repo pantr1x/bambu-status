@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""Bambu Lab printer LAN monitor.
+
+Holds an MQTT-over-TLS connection to the printer and writes the current print
+state to ~/.cache/bambu-status.json for the Plasma applet to read.
+
+Implements just enough of MQTT 3.1.1 (CONNECT / SUBSCRIBE / PUBLISH / PINGREQ)
+to avoid a paho-mqtt dependency, which would need root to install.
+
+Config: ~/.config/bambu-monitor.json
+    {"host": "...", "serial": "...", "accessCode": "...", "model": "P1S"}
+"""
+
+import json
+import os
+import socket
+import ssl
+import struct
+import sys
+import threading
+import time
+from pathlib import Path
+
+CONF = Path.home() / ".config" / "bambu-monitor.json"
+OUT = Path.home() / ".cache" / "bambu-status.json"
+CMD = Path.home() / ".cache" / "bambu-command"      # applet drops a verb here
+FRAME = Path.home() / ".cache" / "bambu-frame.jpg"  # latest camera frame
+PORT = 8883
+CAM_PORT = 6000
+KEEPALIVE = 60
+
+# only these may be sent to the printer; anything else in the command file is
+# ignored rather than forwarded
+ALLOWED_COMMANDS = ("pause", "resume", "stop", "reprint")
+
+
+# ---------------------------------------------------------------- MQTT bits
+def rlen(n):
+    """Encode MQTT remaining-length varint."""
+    out = b""
+    while True:
+        b = n % 128
+        n //= 128
+        out += bytes([b | (0x80 if n else 0)])
+        if not n:
+            return out
+
+
+def mstr(s):
+    b = s.encode("utf-8")
+    return struct.pack(">H", len(b)) + b
+
+
+def connect_packet(client_id, user, password):
+    vh = mstr("MQTT") + bytes([4, 0xC2]) + struct.pack(">H", KEEPALIVE)
+    payload = mstr(client_id) + mstr(user) + mstr(password)
+    body = vh + payload
+    return bytes([0x10]) + rlen(len(body)) + body
+
+
+def subscribe_packet(topic, pid=1):
+    body = struct.pack(">H", pid) + mstr(topic) + bytes([0])
+    return bytes([0x82]) + rlen(len(body)) + body
+
+
+def publish_packet(topic, payload):
+    body = mstr(topic) + payload.encode("utf-8")
+    return bytes([0x30]) + rlen(len(body)) + body
+
+
+def read_rlen(sock):
+    mult, value = 1, 0
+    while True:
+        b = sock.recv(1)
+        if not b:
+            raise ConnectionError("connection closed")
+        value += (b[0] & 127) * mult
+        if not (b[0] & 128):
+            return value
+        mult *= 128
+        if mult > 128 ** 3:
+            raise ValueError("bad remaining length")
+
+
+def recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("connection closed")
+        buf += chunk
+    return buf
+
+
+# ---------------------------------------------------------------- state
+# Bambu encodes the model in the serial prefix. The user-visible device name is
+# only known to the cloud account, and the printer does not answer SSDP in LAN
+# mode, so this is the most specific name obtainable offline.
+SERIAL_MODELS = {
+    "00M": "X1C", "00W": "X1", "03W": "X1E",
+    "01S": "P1P", "01P": "P1S",
+    "030": "A1 mini", "039": "A1",
+    "094": "H2D",
+}
+
+
+def model_from_serial(serial):
+    return SERIAL_MODELS.get(serial[:3], "Bambu")
+
+
+STATE_LABELS = {
+    "RUNNING": "Printing",
+    "PAUSE": "Paused",
+    "FINISH": "Done",
+    "FAILED": "Failed",
+    "IDLE": "Idle",
+    "PREPARE": "Preparing",
+    "SLICING": "Slicing",
+}
+
+
+def clean_name(raw):
+    if not raw:
+        return ""
+    name = os.path.basename(raw)
+    for ext in (".gcode.3mf", ".3mf", ".gcode"):
+        if name.lower().endswith(ext):
+            name = name[: -len(ext)]
+            break
+    return name.replace("_", " ").strip()
+
+
+def write_state(d, connected=True, error=""):
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    # per-pid temp file: two instances racing on one temp name make the rename
+    # fail with FileNotFoundError
+    tmp = OUT.with_name(f".{OUT.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(d | {"connected": connected, "error": error,
+                                   "updated": int(time.time())}))
+    tmp.replace(OUT)
+
+
+def snapshot(p, model):
+    """Extract the fields the applet needs from a print report."""
+    state = (p.get("gcode_state") or "").upper()
+    pct = p.get("mc_percent")
+    remain = p.get("mc_remaining_time")
+    name = clean_name(p.get("subtask_name") or p.get("gcode_file"))
+    layer, total = p.get("layer_num"), p.get("total_layer_num")
+    return {
+        "name": name,
+        "state": state,
+        "label": STATE_LABELS.get(state, state.title() or "—"),
+        "percent": int(pct) if isinstance(pct, (int, float)) else 0,
+        "remainingMin": int(remain) if isinstance(remain, (int, float)) else 0,
+        "layer": int(layer) if isinstance(layer, (int, float)) else 0,
+        "totalLayers": int(total) if isinstance(total, (int, float)) else 0,
+        "nozzle": p.get("nozzle_temper"),
+        "bed": p.get("bed_temper"),
+        "model": model,
+        "gcodeFile": p.get("gcode_file") or "",
+        "printing": state in ("RUNNING", "PAUSE", "PREPARE"),
+    }
+
+
+def run_once(conf):
+    host = conf["host"]
+    serial = conf["serial"]
+    # "name" in the config wins; otherwise derive it from the serial
+    model = conf.get("name") or conf.get("model") or model_from_serial(serial)
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    # the printer serves a self-signed cert with no usable chain on the LAN
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    raw = socket.create_connection((host, PORT), timeout=10)
+    sock = ctx.wrap_socket(raw, server_hostname=host)
+    sock.settimeout(KEEPALIVE + 15)
+
+    sock.sendall(connect_packet(f"plasma-{os.getpid()}", "bblp", conf["accessCode"]))
+    hdr = recv_exact(sock, 1)
+    n = read_rlen(sock)
+    body = recv_exact(sock, n)
+    if hdr[0] >> 4 != 2 or len(body) < 2 or body[1] != 0:
+        code = body[1] if len(body) > 1 else -1
+        raise PermissionError(f"CONNACK rejected, code {code} "
+                              "(bad access code or LAN mode disabled)")
+
+    sock.sendall(subscribe_packet(f"device/{serial}/report"))
+    sock.sendall(publish_packet(
+        f"device/{serial}/request",
+        json.dumps({"pushing": {"sequence_id": "1", "command": "pushall"}})))
+
+    stop_cam = threading.Event()
+    cam = threading.Thread(target=camera_loop,
+                           args=(host, conf["accessCode"], stop_cam), daemon=True)
+    cam.start()
+
+    merged = {}
+    last_ping = last_pushall = last_msg = time.time()
+    while True:
+        now = time.time()
+        if now - last_ping > KEEPALIVE - 15:
+            sock.sendall(bytes([0xC0, 0x00]))
+            last_ping = now
+        # the printer only sends deltas; ask for a full report periodically
+        if now - last_pushall > 300:
+            sock.sendall(publish_packet(
+                f"device/{serial}/request",
+                json.dumps({"pushing": {"sequence_id": "1", "command": "pushall"}})))
+            last_pushall = now
+
+        # a half-open TCP connection stays readable-but-silent forever, so
+        # silence is the only symptom: poke it, then give up and reconnect
+        quiet = now - last_msg
+        if quiet > 60 and now - last_pushall > 20:
+            sock.sendall(publish_packet(
+                f"device/{serial}/request",
+                json.dumps({"pushing": {"sequence_id": "1", "command": "pushall"}})))
+            last_pushall = now
+        if quiet > 180:
+            raise ConnectionError(f"silent for {int(quiet)}s — reconnecting")
+
+        if CMD.exists():
+            pump_commands(sock, serial, merged)
+
+        sock.settimeout(2)
+        try:
+            hdr = recv_exact(sock, 1)
+        except socket.timeout:
+            continue
+
+        n = read_rlen(sock)
+        body = recv_exact(sock, n) if n else b""
+        if hdr[0] >> 4 != 3:          # only care about PUBLISH
+            continue
+
+        tlen = struct.unpack(">H", body[:2])[0]
+        payload = body[2 + tlen:]
+        try:
+            msg = json.loads(payload.decode("utf-8", "replace"))
+        except json.JSONDecodeError:
+            continue
+
+        last_msg = time.time()
+        p = msg.get("print")
+        if not isinstance(p, dict):
+            continue
+        merged.update(p)               # reports are partial, accumulate them
+        write_state(snapshot(merged, model))
+
+
+def camera_loop(host, code, stop_flag):
+    """Bambu's LAN camera is a bespoke TLS stream on 6000: an 80-byte auth
+    blob, then repeating 16-byte headers followed by one JPEG each."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    delay = 5
+    while not stop_flag.is_set():
+        try:
+            raw = socket.create_connection((host, CAM_PORT), timeout=10)
+            sock = ctx.wrap_socket(raw, server_hostname=host)
+            sock.settimeout(15)
+            sock.sendall(struct.pack("<IIII", 0x40, 0x3000, 0, 0)
+                         + b"bblp".ljust(32, b"\x00")
+                         + code.encode().ljust(32, b"\x00"))
+            delay = 5
+            while not stop_flag.is_set():
+                hdr = recv_exact(sock, 16)
+                size = int.from_bytes(hdr[:4], "little")
+                if not 1000 < size < 12_000_000:
+                    raise ValueError(f"implausible frame size {size}")
+                jpeg = recv_exact(sock, size)
+                tmp = FRAME.with_name(f".{FRAME.name}.{os.getpid()}.tmp")
+                tmp.write_bytes(jpeg)
+                tmp.replace(FRAME)
+            sock.close()
+        except Exception:
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+
+
+def reprint_payload(merged):
+    """Rebuild the start-print command for the job the printer last ran.
+
+    The printer needs the 3mf path on its own storage; the report only gives
+    gcode_file, so fall back to the task name when that is not a 3mf."""
+    gfile = merged.get("gcode_file") or ""
+    name = merged.get("subtask_name") or ""
+    base = os.path.basename(gfile)
+    if not base.endswith(".3mf"):
+        base = f"{name}.gcode.3mf" if name else ""
+    if not base:
+        return None
+    return {"print": {
+        "sequence_id": "3",
+        "command": "project_file",
+        "param": "Metadata/plate_1.gcode",
+        "url": f"file:///sdcard/{base}",
+        "subtask_name": name,
+        "bed_type": "auto",
+        "timelapse": False,
+        "bed_leveling": True,
+        "flow_cali": False,
+        "vibration_cali": True,
+        "layer_inspect": False,
+        "use_ams": False,
+        "profile_id": "0", "project_id": "0",
+        "subtask_id": "0", "task_id": "0",
+    }}
+
+
+def pump_commands(sock, serial, merged):
+    """Forward a verb the applet wrote into the command file, then clear it."""
+    try:
+        verb = CMD.read_text().strip()
+    except OSError:
+        return
+    try:
+        CMD.unlink()
+    except OSError:
+        pass
+    if verb not in ALLOWED_COMMANDS:
+        return
+
+    if verb == "reprint":
+        payload = reprint_payload(merged)
+        if payload is None:
+            return
+    else:
+        payload = {"print": {"sequence_id": "2", "command": verb}}
+
+    sock.sendall(publish_packet(f"device/{serial}/request", json.dumps(payload)))
+
+
+def single_instance():
+    """Refuse to start twice: a second connection is wasteful and both would
+    fight over the status file."""
+    import fcntl
+    lock = open(Path.home() / ".cache" / ".bambu-monitor.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("bambu-monitor already running", file=sys.stderr)
+        sys.exit(0)
+    return lock                      # keep the handle alive for the process life
+
+
+def main():
+    Path(Path.home() / ".cache").mkdir(parents=True, exist_ok=True)
+    _lock = single_instance()
+    if not CONF.exists():
+        write_state({}, connected=False, error="missing ~/.config/bambu-monitor.json")
+        sys.exit(1)
+    conf = json.loads(CONF.read_text())
+
+    delay = 5
+    while True:
+        try:
+            run_once(conf)
+        except PermissionError as e:
+            write_state({}, connected=False, error=str(e))
+            sys.exit(2)                # bad credentials — retrying is pointless
+        except Exception as e:
+            write_state({}, connected=False, error=f"{type(e).__name__}: {e}")
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+        else:
+            delay = 5
+
+
+if __name__ == "__main__":
+    main()

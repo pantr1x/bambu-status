@@ -1,0 +1,18 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "pantr1x"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "Bambu Lab print progress",
+        "Icon": "com.bambulab.BambuStudio",
+        "Id": "org.kde.bambu.status",
+        "License": "MIT",
+        "Name": "Bambu Status",
+        "Version": "1.0"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

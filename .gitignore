@@ -1,0 +1,4 @@
+# never commit printer credentials or runtime state
+bambu-monitor.json
+*.log
+__pycache__/
