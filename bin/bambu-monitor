@@ -19,6 +19,7 @@ everything below has to stay importable and free of side effects.
 
 import json
 import os
+import re
 import socket
 import ssl
 import struct
@@ -818,6 +819,38 @@ def _dump_walk(node, trail, rows, depth=0):
             _dump_walk(item, f"{trail}[{i}]", rows, depth + 1)
 
 
+# A Bambu serial always starts with one of the model prefixes, which makes it
+# findable in a file whose key names mean nothing to us.
+SERIAL_RE = re.compile(
+    r"\b(?:" + "|".join(SERIAL_MODELS) + r")[0-9A-Z]{9,17}\b")
+
+
+def deep_scan(root, limit=6000):
+    """Any file at all holding something shaped like a Bambu serial.
+
+    The key-name search only finds layouts we already know; this one finds the
+    file regardless of what the fields are called, or whether it is even JSON."""
+    hits = []
+    seen = 0
+    for path in root.rglob("*"):
+        if seen >= limit or len(hits) >= 20:
+            break
+        try:
+            if not path.is_file() or path.stat().st_size > 4_000_000:
+                continue
+            if any(part.lower() in SKIP_PARTS
+                   for part in path.relative_to(root).parts):
+                continue
+            blob = path.read_bytes()
+        except OSError:
+            continue
+        seen += 1
+        found = SERIAL_RE.findall(blob.decode("utf-8", "replace"))
+        if found:
+            hits.append((path, sorted(set(found))[:4]))
+    return hits, seen
+
+
 def cmd_dump(args):
     """--dump-slicer: show how this machine's slicer stores its printers.
 
@@ -847,10 +880,28 @@ def cmd_dump(args):
             for trail, fields in rows[:8]:
                 shown = ", ".join(f"{k}={v}" for k, v in list(fields.items())[:10])
                 print(f"      {trail}: {shown}")
-    if not total:
-        print("\n  Nothing in there names a printer by address or access code.")
-        print("  That usually means the slicer only ever reached the printer")
-        print("  through the Bambu cloud, which keeps no LAN credentials.")
+    if total:
+        return 0
+
+    print("\n  No file names a printer by address or access code.")
+    print("  Looking for a serial number in every file instead…")
+    anything = False
+    for root in dirs:
+        hits, seen = deep_scan(root)
+        print(f"    {root}  ({seen} files read)")
+        for path, serials in hits:
+            anything = True
+            print(f"      {path.relative_to(root)}: "
+                  + ", ".join(s[:6] + "…" for s in serials))
+    if anything:
+        print("\n  Those files know the printer. Send this output — the importer"
+              "\n  can be taught to read them.")
+    else:
+        print("\n  Nothing anywhere. This slicer has only ever reached the"
+              "\n  printer through the Bambu cloud, which keeps no LAN"
+              "\n  credentials on disk, so there is nothing here to import."
+              "\n  Enter the access code once from the printer's own screen"
+              "\n  (Settings → WLAN) and it will be remembered from then on.")
     return 0
 
 
