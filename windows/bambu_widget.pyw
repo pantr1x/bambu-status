@@ -340,32 +340,55 @@ class MonitorHost:
         self.lock = mon.single_instance()
         self.thread = None
         self.stop = None
+        self.hunted = False
         self.external = self.lock is None
 
     def start(self):
         if self.external or self.thread:
             return
-        if not CONF.exists():
-            mon.write_state({}, connected=False,
-                            error=f"missing {CONF} — right click → Printer settings")
-            return
-        try:
-            conf = json.loads(CONF.read_text(encoding="utf-8-sig"))
-        except ValueError as e:
-            mon.write_state({}, connected=False, error=f"bad config: {e}")
-            return
+        conf = {}
+        if CONF.exists():
+            try:
+                conf = json.loads(CONF.read_text(encoding="utf-8-sig"))
+            except ValueError as e:
+                mon.write_state({}, connected=False, error=f"bad config: {e}")
+                return
         problem = mon.config_problem(conf)
         if problem:
-            mon.write_state({}, connected=False, error=problem)
-            return
+            # nothing on file yet: Bambu Studio almost certainly knows this
+            # printer already, so set ourselves up from it rather than asking
+            found = mon.autoconfig(network=False)
+            if found is None:
+                mon.write_state({}, connected=False,
+                                error="looking for your printer…")
+                self.hunt()             # then try the network, in the background
+                return
+            conf = found
         self.stop = threading.Event()
         self.thread = threading.Thread(target=mon.serve, args=(conf, self.stop),
                                        daemon=True, name="bambu-monitor")
         self.thread.start()
 
+    def hunt(self):
+        """Second attempt, with the LAN listen that takes a few seconds. Runs
+        once; after that the user is better served by the setup window."""
+        if self.hunted:
+            return
+        self.hunted = True
+
+        def work():
+            found = mon.autoconfig(network=True)
+            if found is None:
+                mon.write_state({}, connected=False, error=mon.config_problem({}))
+            else:
+                self.start()
+
+        threading.Thread(target=work, daemon=True).start()
+
     def restart(self):
         if self.external:
             return
+        self.hunted = False
         if self.stop:
             self.stop.set()
         if self.thread:

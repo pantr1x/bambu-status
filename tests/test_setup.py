@@ -27,6 +27,28 @@ def check(label, cond, extra=""):
     if not cond:
         fails.append(label)
 
+# ---------------------------------------------------------------- automatic
+# With Bambu Studio knowing the printer, a first run must need no clicks at all.
+studio = D / "home" / ".config" / "BambuStudio"
+studio.mkdir(parents=True)
+(studio / "BambuStudio.conf").write_text(json.dumps(
+    {"network": {"machines": [
+        {"dev_id": "01P00C612903019", "dev_ip": "192.168.0.102",
+         "access_code": "87654321", "dev_name": "Dielna P1S"}]}}))
+os.environ["HOME"] = str(D / "home")
+
+auto = bw.mon.autoconfig(network=False)
+check("config written without being asked", auto is not None, auto)
+if auto:
+    check("address taken from Bambu Studio", auto["host"] == "192.168.0.102")
+    check("access code taken from Bambu Studio", auto["accessCode"] == "87654321")
+    check("printer name taken from Bambu Studio", auto.get("name") == "Dielna P1S",
+          auto.get("name"))
+    check("what was written is what the monitor wants",
+          bw.mon.config_problem(json.loads((D / "config.json").read_text())) is None)
+
+(D / "config.json").unlink()            # back to nothing, for the dialog run
+
 app = bw.BambuWidget()
 app.root.update()
 

@@ -38,7 +38,8 @@ cd bambu-status
 ./install.sh
 ```
 
-Then fill in `~/.config/bambu-monitor.json`:
+Then fill in `~/.config/bambu-monitor.json` — or leave it, and let the monitor
+work it out from Bambu Studio on its first run:
 
 ```json
 {
@@ -52,7 +53,9 @@ All three are on the printer screen under **Settings → WLAN**. The file is
 created with mode `600`; keep it that way, the access code is a printer
 password.
 
-Or let it fill that in from Bambu Studio, which knows your printer already:
+Or skip that: the monitor fills it in from Bambu Studio, which knows your
+printer already, the first time it starts without a usable config. To do it
+by hand, or to see what it found:
 
 ```bash
 ~/.local/bin/bambu-monitor --detect     # what this machine knows about
@@ -83,20 +86,21 @@ That copies the widget to `%LOCALAPPDATA%\Programs\BambuStatus`, adds a start
 menu entry, starts it at logon, and launches it. Nothing needs admin rights and
 nothing is written outside your profile.
 
-Then let it find the printer for you: right click the widget → **Find my
-printer…**, or click *Find my printer* in the panel.
+**There is usually nothing to configure.** On first run the widget takes the
+address, serial, access code and the name you gave the printer out of **Bambu
+Studio's or OrcaSlicer's own settings** — if either has ever talked to your
+printer, all four are already saved on the machine, and none of it needs the
+printer to be reachable at that moment. Failing that it listens for the
+printer's LAN broadcast, which is also where a current address comes from if it
+has moved since. Windows may ask whether Python can use your private network:
+that is the listening half, and saying no still leaves the slicer import
+working.
 
-It reads **Bambu Studio's and OrcaSlicer's own settings** first. If either has
-ever talked to your printer it already knows the address, the serial and the
-access code, and none of that needs the printer to be reachable at that moment.
-On top of that it listens for the printer's LAN broadcast, which carries a
-current address if it has moved since. Windows may ask whether Python can use
-your private network the first time — that is the listening half; saying no
-still leaves the slicer import working.
-
-Anything it cannot work out you can type in the same window, or edit
-`%APPDATA%\BambuStatus\config.json` by hand — same three keys as above — and
-right click → *Reload settings*.
+Only when that comes up ambiguous or empty does it ask. Right click the widget
+→ **Find my printer…** (or the button in the panel) lists what it found and
+lets you fill in the rest; `%APPDATA%\BambuStatus\config.json` holds the same
+three keys if you would rather type them, followed by right click → *Reload
+settings*.
 
 The widget docks itself to the **left end of the taskbar**. From there:
 

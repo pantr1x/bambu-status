@@ -110,10 +110,13 @@ if (-not $NoStart) {
 }
 
 Write-Host ""
-Write-Host "Done. Next:"
-Write-Host "  1. put your printer details in $conf"
-Write-Host "     (printer screen: Settings -> WLAN shows IP, serial and access code;"
-Write-Host "      LAN mode has to be on)"
-Write-Host "  2. right click the widget on the taskbar -> Reload settings"
+Write-Host "Done. The widget takes the printer's address, serial, access code and"
+Write-Host "name from Bambu Studio or OrcaSlicer by itself, so if either has ever"
+Write-Host "talked to your printer there is nothing left to do."
+Write-Host ""
+Write-Host "If it says it is still looking, set it straight by hand:"
+Write-Host "  right click the widget -> Find my printer...   (or edit $conf)"
+Write-Host "  the printer screen shows all three under Settings -> WLAN,"
+Write-Host "  and LAN mode has to be on."
 Write-Host ""
 Write-Host "Drag the widget to move it, right click it for the menu."

@@ -431,6 +431,43 @@ def autodetect(timeout=6.0, network=True):
                   key=lambda p: (not (p["host"] and p["accessCode"]), p["serial"]))
 
 
+def autoconfig(network=False):
+    """Write the config from what this machine already knows, if that is
+    unambiguous. Returns the config it wrote, or None if it could not tell.
+
+    This is the thing that makes a first run need no setup at all: Bambu Studio
+    has the address, the serial, the access code and the name the user gave the
+    printer, so there is nothing to ask them."""
+    printers = autodetect(network=network)
+    ready = [p for p in printers if p["host"] and p["accessCode"]]
+    if len(ready) > 1:
+        # more than one usable printer: prefer whichever is on this network now
+        live = [p for p in ready if "network" in p.get("source", "")]
+        ready = live if len(live) == 1 else ready
+    if len(ready) != 1:
+        return None
+
+    chosen = ready[0]
+    conf = {}
+    if CONF.exists():
+        try:
+            conf = json.loads(CONF.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            conf = {}
+    conf.update({k: chosen[k] for k in ("host", "serial", "accessCode")})
+    if chosen.get("name"):
+        conf["name"] = chosen["name"]      # what the user calls it in the app
+    if config_problem(conf):
+        return None
+    try:
+        CONF.parent.mkdir(parents=True, exist_ok=True)
+        CONF.write_text(json.dumps(conf, indent=2), encoding="utf-8")
+        os.chmod(CONF, 0o600)              # it holds a printer password
+    except OSError:
+        return None
+    return conf
+
+
 def run_once(conf, stop=None):
     host = conf["host"]
     serial = conf["serial"]
@@ -738,14 +775,22 @@ def main():
     if lock is None:
         print("bambu-monitor already running", file=sys.stderr)
         return 0
-    if not CONF.exists():
-        write_state({}, connected=False, error=f"missing {CONF}")
-        return 1
-    conf = json.loads(CONF.read_text(encoding="utf-8-sig"))
+    conf = {}
+    if CONF.exists():
+        try:
+            conf = json.loads(CONF.read_text(encoding="utf-8-sig"))
+        except ValueError as e:
+            write_state({}, connected=False, error=f"bad config: {e}")
+            return 1
     problem = config_problem(conf)
     if problem:
-        write_state({}, connected=False, error=problem)
-        return 1
+        # nothing usable on file: work it out from Bambu Studio and the LAN
+        found = autoconfig(network=True)
+        if found is None:
+            write_state({}, connected=False,
+                        error=f"{problem} — or run bambu-monitor --setup")
+            return 1
+        conf = found
     return serve(conf)
 
 

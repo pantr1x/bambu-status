@@ -21,8 +21,17 @@ if not fake_printer.ensure_cert():
 D = pathlib.Path(tempfile.mkdtemp(prefix="bambu-live-"))
 os.environ["BAMBU_STATUS_DIR"] = str(D)
 os.environ["BAMBU_MONITOR_CONFIG"] = str(D / "config.json")
-(D / "config.json").write_text(json.dumps(
-    {"host": "127.0.0.1", "serial": "01P00C612903019", "accessCode": "12345678"}))
+
+# No config on file. Instead, Bambu Studio knows the printer — which is how it
+# is on a machine that has ever sliced anything — and the widget is expected to
+# set itself up from that without being asked.
+studio = D / "home" / ".config" / "BambuStudio"
+studio.mkdir(parents=True)
+(studio / "BambuStudio.conf").write_text(json.dumps(
+    {"network": {"machines": [
+        {"dev_id": "01P00C612903019", "dev_ip": "127.0.0.1",
+         "access_code": "12345678", "dev_name": "Dielna P1S"}]}}))
+os.environ["HOME"] = str(D / "home")
 
 # a small PNG stands in for a camera frame: Tk reads PNG everywhere, while the
 # JPEG the printer really sends goes through GDI+, which only exists on Windows
@@ -60,6 +69,12 @@ def check(l, c, extra=""):
 
 app = bw.BambuWidget()
 check("widget runs the monitor itself", not app.monitor.external)
+check("set itself up from Bambu Studio, unasked", (D / "config.json").exists())
+if (D / "config.json").exists():
+    written = json.loads((D / "config.json").read_text())
+    check("address imported", written["host"] == "127.0.0.1", written["host"])
+    check("access code imported", written["accessCode"] == "12345678")
+    check("printer name imported", written.get("name") == "Dielna P1S")
 
 def click(key):
     x0, y0, x1, y1 = app.buttons[key]["box"]
@@ -79,7 +94,10 @@ def wait_for(pred, timeout=12):
 def run():
     # ---- the printer's report has to reach the UI
     check("connected to the printer", wait_for(lambda: app.status.connected))
-    check("model read from the serial", app.status.model == "P1S", app.status.model)
+    check("the printer's own name is shown", app.status.model == "Dielna P1S",
+          app.status.model)
+    check("model still derives from the serial",
+          bw.mon.model_from_serial("01P00C612903019") == "P1S")
     check("progress read", app.status.percent == 63, app.status.percent)
     check("eta read", app.status.remaining == 97, app.status.remaining)
     check("layers read", (app.status.layer, app.status.total_layers) == (184, 312))
