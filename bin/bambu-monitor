@@ -22,6 +22,7 @@ import os
 import re
 import socket
 import ssl
+from concurrent.futures import ThreadPoolExecutor
 import struct
 import sys
 import threading
@@ -231,6 +232,13 @@ def config_problem(conf):
         return ("still the example config — fill in "
                 + ", ".join(missing)
                 + " (printer screen: Settings → WLAN)")
+    if not plausible_host(conf.get("host")):
+        return f"{conf.get('host')!r} is not an address a printer could be at"
+    if not plausible_code(conf.get("accessCode")):
+        return ("the access code should be the eight characters the printer "
+                "shows under Settings → WLAN")
+    if not looks_like_serial(str(conf.get("serial", "")).strip()):
+        return "that serial does not look like a printer's"
     return None
 
 
@@ -311,6 +319,78 @@ def discover(timeout=6.0):
     return list(found.values())
 
 
+def local_subnets():
+    """The /24 this machine sits on, per interface, without asking the OS for
+    an interface list it does not portably have."""
+    nets = set()
+    for family, kind in ((socket.AF_INET, socket.SOCK_DGRAM),):
+        s = socket.socket(family, kind)
+        try:
+            s.connect(("192.168.1.1", 9))   # no packet leaves, it just routes
+            ip = s.getsockname()[0]
+            if plausible_host(ip):
+                nets.add(ip.rsplit(".", 1)[0])
+        except OSError:
+            pass
+        finally:
+            s.close()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if plausible_host(ip):
+                nets.add(ip.rsplit(".", 1)[0])
+    except OSError:
+        pass
+    return sorted(nets)
+
+
+def port_open(host, port=PORT, timeout=0.6):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def scan_lan(hosts=None, workers=64, timeout=0.6):
+    """Every address on the local networks with the printer's MQTT port open.
+
+    This is the fallback for a printer that never announces itself — a firewall
+    eating the broadcast, or a network that does not pass multicast."""
+    if hosts is None:
+        hosts = [f"{net}.{i}" for net in local_subnets() for i in range(1, 255)]
+    if not hosts:
+        return []
+    found = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for host, is_open in zip(hosts, pool.map(
+                lambda h: port_open(h, PORT, timeout), hosts)):
+            if is_open:
+                found.append(host)
+    return found
+
+
+def accepts(host, code, timeout=5):
+    """Does this address answer to that access code? Confirms both at once."""
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        raw = socket.create_connection((host, PORT), timeout=timeout)
+        sock = ctx.wrap_socket(raw, server_hostname=host)
+        sock.settimeout(timeout)
+        try:
+            sock.sendall(connect_packet(f"probe-{os.getpid()}", "bblp", code))
+            hdr = recv_exact(sock, 1)
+            n = read_rlen(sock)
+            body = recv_exact(sock, n)
+            return hdr[0] >> 4 == 2 and len(body) > 1 and body[1] == 0
+        finally:
+            sock.close()
+    except OSError:
+        return False
+
+
 # Bambu Studio and OrcaSlicer remember every printer they have talked to —
 # address, serial and access code — so the details can be picked up off this
 # machine without waiting for the printer to announce itself. The layout of
@@ -342,7 +422,44 @@ def slicer_config_dirs():
                 homes.append(Path(base))
     else:
         homes += [Path.home() / ".config", Path.home()]
-    return [h / name for h in homes for name in SLICER_DIRS if (h / name).is_dir()]
+    found, seen = [], set()
+    for home in homes:
+        for name in SLICER_DIRS:
+            path = home / name
+            if not path.is_dir():
+                continue
+            key = str(path.resolve()).lower()   # Windows paths are caseless
+            if key not in seen:
+                seen.add(key)
+                found.append(path)
+    return found
+
+
+def plausible_host(host):
+    """A LAN address a printer could actually be at."""
+    host = str(host or "").strip()
+    if not host or host in PLACEHOLDERS:
+        return False
+    if IPV4_RE.fullmatch(host):
+        try:
+            octets = [int(o) for o in host.split(".")]
+        except ValueError:
+            return False
+        if len(octets) != 4 or any(not 0 <= o <= 255 for o in octets):
+            return False
+        # 0.x, link-local and broadcast are never a printer. Loopback is:
+        # reaching it down an SSH tunnel is a real thing people do.
+        return not (octets[0] in (0, 255) or octets[:2] == [169, 254])
+    # a hostname, then: something resolvable-looking rather than punctuation
+    return (3 <= len(host) <= 253
+            and all(c.isalnum() or c in "-." for c in host)
+            and any(c.isalnum() for c in host))
+
+
+def plausible_code(code):
+    """Bambu access codes are eight alphanumeric characters."""
+    code = str(code or "").strip()
+    return len(code) == 8 and code.isalnum() and code != "00000000"
 
 
 def looks_like_serial(key):
@@ -363,19 +480,31 @@ def _record(node, key_serial=None):
     A serial alone is not enough — "name" and "model" appear all over a slicer's
     presets — so it has to carry an access code or an address as well."""
     flat = _flat(node)
+    # a config root is not a device record: reading one as though it were is how
+    # an address of 00.00.00.00 and a one-character access code got in
+    if len(flat) > 40:
+        return None
 
     def first(keys):
         return next((flat[k] for k in keys if flat.get(k)), "")
 
-    # a serial and an address give themselves away by their shape, so when the
-    # field names are ones we have never seen, go by that instead. Not the
-    # access code though — guessing at a credential is worse than not having it
-    serial = (first(ID_KEYS) or key_serial or
-              next((v for v in flat.values() if SERIAL_RE.fullmatch(v)), ""))
+    # a serial gives itself away by its shape, so where the field names are ones
+    # nobody has seen, go by that — but only in an object small enough to be
+    # about a single device
+    serial = first(ID_KEYS) or key_serial or ""
+    if not looks_like_serial(serial) and len(flat) <= 12:
+        serial = next((v for v in flat.values() if SERIAL_RE.fullmatch(v)), "")
     if not looks_like_serial(serial):
         return None
+
+    # never carry a value forward that cannot be what it claims to be. Guessing
+    # at a credential is worse than leaving it empty and saying so.
     code = first(CODE_KEYS)
-    host = first(IP_KEYS) or next((v for v in flat.values() if IPV4_RE.fullmatch(v)), "")
+    code = code if plausible_code(code) else ""
+    host = first(IP_KEYS)
+    if not plausible_host(host):
+        host = next((v for v in flat.values()
+                     if IPV4_RE.fullmatch(v) and plausible_host(v)), "")
     if not code and not host:
         return None
     return {"serial": serial, "accessCode": code, "host": host,
@@ -478,7 +607,7 @@ def slicer_access_codes():
             for p in slicer_printers() if p["accessCode"]}
 
 
-def autodetect(timeout=6.0, network=True):
+def autodetect(timeout=6.0, network=True, scan=None):
     """Every printer this machine knows about.
 
     The slicer's own settings come first and need no network at all; a printer
@@ -499,6 +628,34 @@ def autodetect(timeout=6.0, network=True):
                 live["accessCode"] = ""
                 live["source"] = "on the network"
                 known[live["serial"]] = live
+    # Nothing announced itself and we still have no address? Look for the
+    # printer directly. Held back unless asked for, or unless there is an
+    # access code to confirm a find with, because it is a subnet sweep.
+    homeless = [p for p in known.values() if not plausible_host(p["host"])]
+    want_scan = scan if scan is not None else any(p["accessCode"] for p in homeless)
+    if network and want_scan and homeless:
+        taken = {p["host"] for p in known.values() if p["host"]}
+        for host in scan_lan():
+            if host in taken:
+                continue
+            matched = next((p for p in homeless
+                            if p["accessCode"] and accepts(host, p["accessCode"])),
+                           None)
+            if matched:
+                matched["host"] = host
+                matched["source"] += " · found by scanning the network"
+                homeless.remove(matched)
+                continue
+            # something is listening but cannot be confirmed without a code:
+            # offer it, paired with the saved printer if there is only one
+            lone = homeless[0] if len(homeless) == 1 else None
+            known[f"scan:{host}"] = {
+                "serial": lone["serial"] if lone else "",
+                "host": host, "accessCode": "",
+                "name": lone["name"] if lone else "",
+                "model": lone["model"] if lone else "Bambu",
+                "source": "answers on 8883, access code needed"}
+
     # the ones that are ready to use first
     return sorted(known.values(),
                   key=lambda p: (not (p["host"] and p["accessCode"]), p["serial"]))
@@ -1042,6 +1199,16 @@ def cmd_doctor(args):
         if not live:
             print("      nothing heard: another network, LAN mode off, or a "
                   "firewall is blocking UDP 2021")
+            print(f"    scanning {', '.join(n + '.0/24' for n in local_subnets())} "
+                  f"for port {PORT}…")
+            open_hosts = scan_lan()
+            if open_hosts:
+                print(f"      {len(open_hosts)} address(es) answer on {PORT}: "
+                      + ", ".join(open_hosts[:8]))
+                print("      one of those is the printer — LAN mode is on")
+            else:
+                print("      nothing on this network answers on 8883 at all,"
+                      " which means LAN mode is off or the printer is elsewhere")
 
     host = conf.get("host") or next((p["host"] for p in printers if p["host"]), "")
     code = conf.get("accessCode") or next((p["accessCode"] for p in printers

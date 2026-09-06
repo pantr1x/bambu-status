@@ -113,7 +113,10 @@ class FakePrinter:
         return fields[2] if len(fields) == 3 else ""
 
     def session(self, raw):
-        sock = self.ctx.wrap_socket(raw, server_side=True)
+        try:
+            sock = self.ctx.wrap_socket(raw, server_side=True)
+        except (ssl.SSLError, OSError):
+            return          # a port scan connects and drops without a handshake
         hdr = recv_exact(sock, 1); n = read_rlen(sock)
         body = recv_exact(sock, n)                                             # CONNECT
         if self.connect_password(body) != self.access_code:

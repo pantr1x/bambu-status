@@ -152,7 +152,9 @@ inside the widget on Windows:
   `bambu-frame.jpg`
 - watches `bambu-command` and forwards `pause`, `resume`, `stop` or `reprint`
   to the printer
-- and, on demand, works out what to connect to: the printers Bambu Studio or
+- and, on demand, works out what to connect to: a subnet sweep for the MQTT
+  port when nothing announces itself, confirmed by the access code so it knows
+  it has the right machine; the printers Bambu Studio or
   OrcaSlicer have saved (their config layout has changed between releases, so
   it walks the tree for anything that looks like a saved printer rather than
   pinning a schema), plus whatever answers the SSDP broadcast on the LAN
@@ -192,6 +194,7 @@ xvfb-run -a python3 tests/test_live.py    # the whole chain, needs openssl
 xvfb-run -a python3 tests/test_setup.py   # the find-my-printer dialog
 python3 tests/test_discovery.py           # SSDP and the slicer config scan
 python3 tests/test_doctor.py              # that --doctor names the real cause
+python3 tests/test_validation.py          # what may be believed, and the LAN scan
 ```
 
 `test_live.py` runs the actual widget against the fake printer and checks the
