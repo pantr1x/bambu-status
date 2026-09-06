@@ -182,6 +182,20 @@ def taskbar():
             "edge": EDGE_BOTTOM, "autohide": False, "found": False}
 
 
+def work_area():
+    """The screen minus the taskbar — where a window can sit without being
+    covered. Used when the taskbar rect is unusable (auto-hide, mostly)."""
+    if IS_WINDOWS:
+        r = RECT()
+        SPI_GETWORKAREA = 0x0030
+        if user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(r), 0):
+            return {"x": r.left, "y": r.top,
+                    "w": r.right - r.left, "h": r.bottom - r.top}
+    w = user32.GetSystemMetrics(0) if IS_WINDOWS else 1920
+    h = user32.GetSystemMetrics(1) if IS_WINDOWS else 1080
+    return {"x": 0, "y": 0, "w": w, "h": h - 48}
+
+
 # ---------------------------------------------------------------- theme
 def system_theme():
     """{'dark': bool, 'taskbar': '#rrggbb'} from the user's Windows settings."""

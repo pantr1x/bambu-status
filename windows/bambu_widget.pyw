@@ -81,10 +81,12 @@ class Theme:
         self.panel_line = mix(self.panel_bg, self.text, 0.16)
         self.panel_text = "#f2f2f2" if self.dark else "#1b1b1b"
         self.panel_dim = mix(self.panel_text, self.panel_bg, 0.45)
-        # the chip is what the user actually sees on the taskbar: a shade off
-        # the taskbar colour so it reads as a widget rather than a mismatch
-        self.chip_bg = mix(self.bar_bg, "#ffffff" if self.dark else "#000000", 0.08)
-        self.chip_line = mix(self.chip_bg, self.text, 0.12)
+        # the chip is what the user actually sees on the taskbar. Against the
+        # translucent Win11 bar a subtle tint disappears, so it is a clear step
+        # off the taskbar colour with a visible edge.
+        self.chip_bg = mix(self.bar_bg, "#ffffff" if self.dark else "#000000",
+                           float(cfg.get("chipContrast", 0.16)))
+        self.chip_line = mix(self.chip_bg, self.text, 0.28)
         self.track = mix(self.chip_bg, self.text, 0.18)
         self.panel_track = mix(self.panel_bg, self.panel_text, 0.14)
 
@@ -401,9 +403,11 @@ class BambuWidget:
 
     def bar_height(self):
         tb = winui.taskbar()
+        if tb["autohide"] or tb["h"] < self.px(16):
+            return self.px(34)
         if tb["edge"] in (winui.EDGE_TOP, winui.EDGE_BOTTOM):
-            return max(self.px(20), min(self.px(44), tb["h"] - self.px(8)))
-        return self.px(30)
+            return max(self.px(22), min(self.px(46), tb["h"] - self.px(6)))
+        return self.px(34)
 
     def bar_items(self):
         """What goes on the chip, measured, so the chip can be drawn first."""
@@ -429,7 +433,7 @@ class BambuWidget:
     def draw_bar(self):
         c, s, t = self.bar_canvas, self.status, self.theme
         h = self.bar_height()
-        pad, gap = self.px(10), self.px(6)
+        pad, gap = self.px(11), self.px(7)
         items = self.bar_items()
         width = int(sum(i[2] for i in items) + gap * (len(items) - 1) + 2 * pad)
 
@@ -439,7 +443,7 @@ class BambuWidget:
             self.place_bar()
 
         c.delete("all")
-        chip_h = min(h - self.px(4), self.px(30))
+        chip_h = min(h - self.px(3), self.px(32))
         top, mid = (h - chip_h) / 2, h / 2
         bordered_rrect(c, 0, top, width, top + chip_h, self.px(8),
                        t.chip_bg, t.chip_line, width=max(1, self.px(1)))
@@ -448,7 +452,7 @@ class BambuWidget:
         for kind, payload, w in items:
             if kind == "logo":
                 draw_logo(c, x, mid - w / 2, w,
-                          GREEN if s.connected else mix(GREEN, t.chip_bg, 0.55),
+                          GREEN if s.connected else mix(GREEN, t.chip_bg, 0.3),
                           gap=t.chip_bg)
             elif kind == "text":
                 text, color = payload
@@ -480,7 +484,13 @@ class BambuWidget:
             x, y = int(self.cfg.get("x", 40)), int(self.cfg.get("y", 40))
         else:
             off = self.px(self.cfg.get("offset", 12))
-            if tb["edge"] in (winui.EDGE_TOP, winui.EDGE_BOTTOM):
+            if tb["autohide"] or tb["h"] < self.px(16):
+                # nothing to sit on: hug the bottom of the usable screen instead
+                wa = winui.work_area()
+                y = wa["y"] + wa["h"] - h - self.px(6)
+                x = (wa["x"] + off if self.cfg.get("align") == "left"
+                     else wa["x"] + wa["w"] - w - off)
+            elif tb["edge"] in (winui.EDGE_TOP, winui.EDGE_BOTTOM):
                 y = tb["y"] + (tb["h"] - h) // 2
                 x = (tb["x"] + off if self.cfg.get("align") == "left"
                      else tb["x"] + tb["w"] - w - off)
@@ -901,5 +911,35 @@ def wrap(text, font, maxw, limit=3):
     return [elide(l, font, maxw) for l in out[:limit]]
 
 
+def diagnose():
+    """python bambu_widget.pyw --diag — print what the widget sees and exit."""
+    app = BambuWidget()
+    app.root.update()
+    rows = [
+        ("python", sys.version.split()[0]),
+        ("dpi scale", app.scale),
+        ("screen", (app.root.winfo_screenwidth(), app.root.winfo_screenheight())),
+        ("taskbar", winui.taskbar()),
+        ("work area", winui.work_area()),
+        ("dark theme", app.theme.dark),
+        ("taskbar colour", app.theme.bar_bg),
+        ("chip colour", app.theme.chip_bg),
+        ("transparency", app.bar_key != app.theme.bar_bg),
+        ("bar asked for", (app.bar_x, app.bar_y, app.bar_w, app.bar_h)),
+        ("bar reports", app.bar.winfo_geometry()),
+        ("config", f"{CONF} exists={CONF.exists()}"),
+        ("status file", f"{STATE} exists={STATE.exists()}"),
+        ("camera frame", f"{FRAME} exists={FRAME.exists()}"),
+        ("monitor", "external" if app.monitor.external else "in this process"),
+        ("state", app.status.data or "(nothing read yet)"),
+    ]
+    for key, val in rows:
+        print(f"{key:>16}: {val}")
+    app.quit()
+
+
 if __name__ == "__main__":
-    BambuWidget().run()
+    if "--diag" in sys.argv:
+        diagnose()
+    else:
+        BambuWidget().run()
