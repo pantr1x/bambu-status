@@ -415,8 +415,10 @@ class SetupDialog:
                 row=2 + i, column=1, sticky="ew", pady=(8 if not i else 4, 0))
 
         ttk.Label(frm, foreground="#888888", wraplength=330,
-                  text="The access code is on the printer: Settings → WLAN. "
-                       "LAN mode has to be on.").grid(
+                  text="Taken from Bambu Studio or OrcaSlicer if either has "
+                       "talked to the printer, otherwise from the printer's own "
+                       "broadcast. The access code is on the printer: "
+                       "Settings → WLAN.").grid(
             row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         row = ttk.Frame(frm)
@@ -444,34 +446,52 @@ class SetupDialog:
                 var.set(val)
 
     def search(self):
+        """Bambu Studio's own settings first — that needs no network and is
+        instant — then the LAN broadcast on top of it."""
         self.search_btn.state(["disabled"])
-        self.note.set("Looking for printers on the network…")
-        self.list.delete(0, "end")
+        self.found = mon.autodetect(network=False)
+        if self.found:
+            ready = sum(1 for p in self.found if p["host"] and p["accessCode"])
+            self.note.set(f"Found {len(self.found)} in your Bambu slicer"
+                          + (f", {ready} ready to use" if ready else "")
+                          + ". Checking the network too…")
+        else:
+            self.note.set("Nothing saved in Bambu Studio. Listening for the "
+                          "printer on the network…")
+        self.fill_list()
+
         result = []
-        thread = threading.Thread(target=lambda: result.extend(mon.autodetect(6.0)),
-                                  daemon=True)
+        thread = threading.Thread(
+            target=lambda: result.extend(mon.autodetect(6.0)), daemon=True)
         thread.start()
 
         def poll():
             if thread.is_alive():
                 self.win.after(300, poll)
                 return
-            self.found = result
             self.search_btn.state(["!disabled"])
-            if not result:
-                self.note.set("Nothing announced itself. Type the details in by hand "
-                              "— printer screen: Settings → WLAN.")
-                return
-            self.note.set(f"Found {len(result)}. Pick one:")
-            for p in result:
-                label = f"{p['model']} · {p['host']} · {p['serial']}"
-                if p.get("name"):
-                    label = f"{p['model']} · {p['name']} · {p['host']}"
-                self.list.insert("end", label)
+            if result:
+                self.found = result
+                self.fill_list()
+                self.note.set(f"{len(result)} printer(s). Pick one:")
+            elif not self.found:
+                self.note.set("Nothing found. Type the details in by hand — "
+                              "printer screen: Settings → WLAN.")
+
+        self.win.after(400, poll)
+
+    def fill_list(self):
+        keep = self.host.get().strip()
+        self.list.delete(0, "end")
+        for p in self.found:
+            where = p["host"] or "address unknown"
+            label = f"{p['model']} · {where} · {p.get('source', '')}"
+            if p.get("name"):
+                label = f"{p['model']} · {p['name']} · {where}"
+            self.list.insert("end", label)
+        if self.found and not keep:
             self.list.selection_set(0)
             self.pick()
-
-        self.win.after(300, poll)
 
     def pick(self, _event=None):
         idx = self.list.curselection()
@@ -482,7 +502,10 @@ class SetupDialog:
         self.serial.set(p["serial"])
         if p.get("accessCode"):
             self.code.set(p["accessCode"])
-            self.note.set("Access code found in your Bambu slicer's settings.")
+            self.note.set("Address and access code taken from your Bambu slicer.")
+        elif not self.code.get():
+            self.note.set("Bambu Studio has no access code saved for this one — "
+                          "it is on the printer: Settings → WLAN.")
 
     def save(self):
         conf = {}

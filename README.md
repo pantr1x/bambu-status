@@ -52,6 +52,17 @@ All three are on the printer screen under **Settings → WLAN**. The file is
 created with mode `600`; keep it that way, the access code is a printer
 password.
 
+Or let it fill that in from Bambu Studio, which knows your printer already:
+
+```bash
+~/.local/bin/bambu-monitor --detect     # what this machine knows about
+~/.local/bin/bambu-monitor --setup      # write the config from it
+```
+
+`--detect` reads Bambu Studio's and OrcaSlicer's saved printers and listens for
+the printer's own LAN broadcast; `--setup` writes the one it found, or
+`--setup 2` to pick from the list. Add `--offline` to skip the network half.
+
 Start it and add the widget:
 
 ```bash
@@ -73,12 +84,15 @@ menu entry, starts it at logon, and launches it. Nothing needs admin rights and
 nothing is written outside your profile.
 
 Then let it find the printer for you: right click the widget → **Find my
-printer…**, or click *Find my printer* in the panel. In LAN mode the printer
-broadcasts its address, serial and model over SSDP, and the access code is
-looked up in Bambu Studio's or OrcaSlicer's saved settings if either has ever
-talked to it. Windows will ask whether Python may listen on your private
-network the first time — say yes, that is the discovery listening for the
-broadcast.
+printer…**, or click *Find my printer* in the panel.
+
+It reads **Bambu Studio's and OrcaSlicer's own settings** first. If either has
+ever talked to your printer it already knows the address, the serial and the
+access code, and none of that needs the printer to be reachable at that moment.
+On top of that it listens for the printer's LAN broadcast, which carries a
+current address if it has moved since. Windows may ask whether Python can use
+your private network the first time — that is the listening half; saying no
+still leaves the slicer import working.
 
 Anything it cannot work out you can type in the same window, or edit
 `%APPDATA%\BambuStatus\config.json` by hand — same three keys as above — and
@@ -134,6 +148,10 @@ inside the widget on Windows:
   `bambu-frame.jpg`
 - watches `bambu-command` and forwards `pause`, `resume`, `stop` or `reprint`
   to the printer
+- and, on demand, works out what to connect to: the printers Bambu Studio or
+  OrcaSlicer have saved (their config layout has changed between releases, so
+  it walks the tree for anything that looks like a saved printer rather than
+  pinning a schema), plus whatever answers the SSDP broadcast on the LAN
 
 Those three files live in `~/.cache` on Linux and `%LOCALAPPDATA%\BambuStatus`
 on Windows. The UI only reads them. It never holds the access code.

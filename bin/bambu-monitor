@@ -310,13 +310,18 @@ def discover(timeout=6.0):
     return list(found.values())
 
 
-# Bambu Studio and OrcaSlicer keep the access code for every printer they have
-# talked to. The layout of those files has changed between releases, so rather
-# than pin one schema this walks the config tree and picks out anything that
-# looks like an access code next to a device id.
-SLICER_DIRS = ("BambuStudio", "OrcaSlicer", "BambuNetworkEngine")
-CODE_KEYS = ("access_code", "accesscode", "dev_access_code", "printer_access_code")
-ID_KEYS = ("dev_id", "device_id", "serial", "sn", "usn", "printer_sn")
+# Bambu Studio and OrcaSlicer remember every printer they have talked to —
+# address, serial and access code — so the details can be picked up off this
+# machine without waiting for the printer to announce itself. The layout of
+# those files has moved around between releases, so rather than pin one schema
+# this walks the config tree for anything that looks like a saved printer.
+SLICER_DIRS = ("BambuStudio", "OrcaSlicer", "BambuNetworkEngine",
+               "bambu-studio", "OrcaSlicer-nightly")
+CODE_KEYS = ("access_code", "accesscode", "dev_access_code", "printer_access_code",
+             "lan_access_code")
+ID_KEYS = ("dev_id", "device_id", "serial", "sn", "usn", "printer_sn", "dev_sn")
+IP_KEYS = ("dev_ip", "ip", "host", "printer_ip", "dev_address", "lan_ip")
+NAME_KEYS = ("dev_name", "device_name", "printer_name", "dev_alias")
 
 
 def slicer_config_dirs():
@@ -338,44 +343,92 @@ def looks_like_serial(key):
             and any(c.isdigit() for c in k) and any(c.isalpha() for c in k))
 
 
-def _harvest(node, out, serial=None):
-    """Walk parsed JSON collecting {serial or None: access code}."""
+def _flat(node):
+    return {str(k).lower(): str(v).strip()
+            for k, v in node.items() if isinstance(v, (str, int, float))}
+
+
+def _record(node, key_serial=None):
+    """What this dict holds, if it looks like a saved printer.
+
+    A serial alone is not enough — "name" and "model" appear all over a slicer's
+    presets — so it has to carry an access code or an address as well."""
+    flat = _flat(node)
+
+    def first(keys):
+        return next((flat[k] for k in keys if flat.get(k)), "")
+
+    serial = first(ID_KEYS) or (key_serial or "")
+    if not looks_like_serial(serial):
+        return None
+    code, host = first(CODE_KEYS), first(IP_KEYS)
+    if not code and not host:
+        return None
+    return {"serial": serial, "accessCode": code, "host": host,
+            "name": first(NAME_KEYS), "model": model_from_serial(serial)}
+
+
+def _walk(node, out, key_serial=None):
     if isinstance(node, dict):
-        lowered = {str(k).lower(): v for k, v in node.items()}
-        code = next((str(lowered[k]) for k in CODE_KEYS
-                     if isinstance(lowered.get(k), (str, int))), None)
-        here = next((str(lowered[k]) for k in ID_KEYS
-                     if isinstance(lowered.get(k), (str, int))), serial)
-        if code and code.strip():
-            out.setdefault(here, code.strip())
+        found = _record(node, key_serial)
+        if found:
+            kept = out.setdefault(found["serial"], found)
+            for field in ("accessCode", "host", "name"):
+                if not kept.get(field) and found.get(field):
+                    kept[field] = found[field]      # often split across files
         for key, value in node.items():
-            _harvest(value, out, key if looks_like_serial(key) else here)
+            _walk(value, out, key if looks_like_serial(key) else key_serial)
     elif isinstance(node, list):
         for item in node:
-            _harvest(item, out, serial)
+            _walk(item, out, key_serial)
 
 
-def slicer_access_codes(limit_bytes=2_000_000):
-    """{serial or None: access code} found in the installed slicer's config."""
+def slicer_printers(limit_bytes=4_000_000):
+    """Printers the installed slicer has saved, no network involved."""
     out = {}
     for root in slicer_config_dirs():
-        for path in list(root.rglob("*.json")) + list(root.rglob("*.conf")):
+        for path in sorted(root.rglob("*")):
+            if path.suffix.lower() not in (".json", ".conf", ".cfg") or not path.is_file():
+                continue
             try:
                 if path.stat().st_size > limit_bytes:
                     continue
-                _harvest(json.loads(path.read_text(encoding="utf-8-sig")), out)
+                _walk(json.loads(path.read_text(encoding="utf-8-sig")), out)
             except (OSError, ValueError, RecursionError):
                 continue
-    return out
+    return list(out.values())
 
 
-def autodetect(timeout=6.0):
-    """Everything needed for a config, as far as it can be worked out alone."""
-    printers = discover(timeout)
-    codes = slicer_access_codes()
-    for p in printers:
-        p["accessCode"] = codes.get(p["serial"]) or ""
-    return printers
+def slicer_access_codes():
+    """{serial: access code} from the installed slicer."""
+    return {p["serial"]: p["accessCode"]
+            for p in slicer_printers() if p["accessCode"]}
+
+
+def autodetect(timeout=6.0, network=True):
+    """Every printer this machine knows about.
+
+    The slicer's own settings come first and need no network at all; a printer
+    that is also broadcasting right now contributes its current address, which
+    beats whatever the slicer last wrote down."""
+    known = {}
+    for p in slicer_printers():
+        p["source"] = "Bambu Studio"
+        known[p["serial"]] = p
+    if network:
+        for live in discover(timeout):
+            saved = known.get(live["serial"])
+            if saved:
+                saved["host"] = live["host"] or saved["host"]
+                saved["name"] = saved["name"] or live["name"]
+                saved["source"] = "Bambu Studio · on the network now"
+            else:
+                live["accessCode"] = ""
+                live["source"] = "on the network"
+                known[live["serial"]] = live
+    # the ones that are ready to use first
+    return sorted(known.values(),
+                  key=lambda p: (not (p["host"] and p["accessCode"]), p["serial"]))
 
 
 def run_once(conf, stop=None):
@@ -609,7 +662,78 @@ def serve(conf, stop=None):
     return 0
 
 
+def describe(printers):
+    for i, p in enumerate(printers, 1):
+        print(f"  {i}. {p['model']:>8}  {p['host'] or 'address unknown':<15} "
+              f"{p['serial']}  access code: "
+              f"{'known' if p['accessCode'] else 'not saved'}  ({p['source']})")
+
+
+def cmd_detect(args):
+    """--detect: what this machine knows about, from the slicer and the LAN."""
+    printers = autodetect(network="--offline" not in args)
+    if not printers:
+        print("No printers found. Bambu Studio has none saved and nothing "
+              "announced itself on the network.")
+        return 1
+    print(f"{len(printers)} printer(s):")
+    describe(printers)
+    return 0
+
+
+def cmd_setup(args):
+    """--setup [n]: write the config from what was found."""
+    printers = autodetect(network="--offline" not in args)
+    ready = [p for p in printers if p["host"] and p["accessCode"]]
+    pick = next((int(a) for a in args if a.isdigit()), None)
+    if pick is not None:
+        if not 1 <= pick <= len(printers):
+            print(f"There is no printer {pick}.")
+            describe(printers)
+            return 1
+        chosen = printers[pick - 1]
+    elif len(ready) == 1:
+        chosen = ready[0]
+    else:
+        print("Pick one with --setup <number>:" if printers
+              else "Nothing found to set up.")
+        describe(printers)
+        return 1
+
+    problem = config_problem(chosen)
+    if problem:
+        print(f"Not enough to go on: {problem}")
+        return 1
+    conf = {}
+    if CONF.exists():
+        try:
+            conf = json.loads(CONF.read_text(encoding="utf-8-sig"))
+        except ValueError:
+            pass
+    conf.update({k: chosen[k] for k in ("host", "serial", "accessCode")})
+    CONF.parent.mkdir(parents=True, exist_ok=True)
+    CONF.write_text(json.dumps(conf, indent=2), encoding="utf-8")
+    try:
+        os.chmod(CONF, 0o600)          # it holds a printer password
+    except OSError:
+        pass
+    print(f"Wrote {CONF} for the {chosen['model']} at {chosen['host']}.")
+    return 0
+
+
 def main():
+    args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print(__doc__.strip())
+        print("\n  --detect [--offline]     list printers this machine knows of"
+              "\n  --setup [n] [--offline]  write the config from one of them"
+              "\n  (no arguments)           run the monitor")
+        return 0
+    if "--detect" in args:
+        return cmd_detect(args)
+    if "--setup" in args:
+        return cmd_setup(args)
+
     lock = single_instance()
     if lock is None:
         print("bambu-monitor already running", file=sys.stderr)

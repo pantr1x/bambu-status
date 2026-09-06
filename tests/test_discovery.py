@@ -49,22 +49,51 @@ check("printer discovered on the wire", len(found) == 1, found)
 if found:
     check("discovery reports the serial", found[0]["serial"] == "01P00C612903019")
 
-# --- access code out of a slicer config, whatever shape it is in
+# --- a whole printer out of a slicer config, whatever shape it is in
 home = pathlib.Path(tempfile.mkdtemp(prefix="fakehome-"))
 studio = home / ".config" / "BambuStudio"
 (studio / "user" / "42").mkdir(parents=True)
 (studio / "BambuStudio.conf").write_text(json.dumps(
-    {"app": {"last_device": "x"}, "network": {"machines": [
-        {"dev_id": "01P00C612903019", "dev_ip": "192.168.0.102",
-         "access_code": "87654321", "dev_name": "Dielna P1S"}]}}))
+    {"app": {"last_device": "x"},
+     "network": {"machines": [
+         {"dev_id": "01P00C612903019", "dev_ip": "192.168.0.102",
+          "access_code": "87654321", "dev_name": "Dielna P1S"}]}}))
 (studio / "user" / "42" / "machine.json").write_text(json.dumps(
-    {"printers": {"01P00C999999999": {"accessCode": "11112222"}}}))
+    {"printers": {"00M09A123456789": {"accessCode": "11112222",
+                                      "dev_ip": "192.168.0.77"}}}))
+# presets carry names and models but no serial: they must not become printers
+(studio / "user" / "42" / "presets.json").write_text(json.dumps(
+    {"filament": [{"name": "Bambu PLA Basic", "printer_model": "P1S"}]}))
 os.environ["HOME"] = str(home)      # Path.home() reads $HOME
-codes = mon.slicer_access_codes()
-check("access code found for the printer",
-      codes.get("01P00C612903019") == "87654321", codes)
-check("second printer also picked up",
-      codes.get("01P00C999999999") == "11112222", codes)
+
+printers = {p["serial"]: p for p in mon.slicer_printers()}
+check("printer read out of Bambu Studio", "01P00C612903019" in printers, list(printers))
+if "01P00C612903019" in printers:
+    p1 = printers["01P00C612903019"]
+    check("address read from the slicer", p1["host"] == "192.168.0.102", p1["host"])
+    check("access code read from the slicer", p1["accessCode"] == "87654321")
+    check("printer name read", p1["name"] == "Dielna P1S", p1["name"])
+    check("model derived from the serial", p1["model"] == "P1S", p1["model"])
+check("printer keyed by serial also read", "00M09A123456789" in printers, list(printers))
+check("presets are not mistaken for printers", len(printers) == 2, list(printers))
+
+# --- and it all works with no network at all
+offline = mon.autodetect(network=False)
+check("autodetect works offline", len(offline) == 2, offline)
+ready = [p for p in offline if p["host"] and p["accessCode"]]
+check("saved printers come out ready to use", len(ready) == 2, ready)
+check("source is named", all(p["source"] == "Bambu Studio" for p in offline))
+
+# --- a printer broadcasting now contributes its current address
+threading.Thread(target=beacon, daemon=True).start()
+merged = {p["serial"]: p for p in mon.autodetect(timeout=3.5)}
+check("live address wins over the saved one",
+      merged["01P00C612903019"]["host"] == "192.168.0.102")
+check("saved access code survives the merge",
+      merged["01P00C612903019"]["accessCode"] == "87654321")
+check("merge is reported in the source",
+      "network" in merged["01P00C612903019"]["source"],
+      merged["01P00C612903019"]["source"])
 
 print("\n" + ("ALL PASS" if not fails else f"FAILURES: {fails}"))
 sys.exit(1 if fails else 0)
