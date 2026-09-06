@@ -2,13 +2,19 @@
 """Bambu Lab printer LAN monitor.
 
 Holds an MQTT-over-TLS connection to the printer and writes the current print
-state to ~/.cache/bambu-status.json for the Plasma applet to read.
+state to a status file for the UI (Plasma applet on Linux, the tray widget on
+Windows) to read.
 
 Implements just enough of MQTT 3.1.1 (CONNECT / SUBSCRIBE / PUBLISH / PINGREQ)
 to avoid a paho-mqtt dependency, which would need root to install.
 
-Config: ~/.config/bambu-monitor.json
+Config:
+    Linux    ~/.config/bambu-monitor.json
+    Windows  %APPDATA%\\BambuStatus\\config.json
     {"host": "...", "serial": "...", "accessCode": "...", "model": "P1S"}
+
+The Windows widget imports this module and runs serve() on a thread, so
+everything below has to stay importable and free of side effects.
 """
 
 import json
@@ -21,10 +27,37 @@ import threading
 import time
 from pathlib import Path
 
-CONF = Path.home() / ".config" / "bambu-monitor.json"
-OUT = Path.home() / ".cache" / "bambu-status.json"
-CMD = Path.home() / ".cache" / "bambu-command"      # applet drops a verb here
-FRAME = Path.home() / ".cache" / "bambu-frame.jpg"  # latest camera frame
+APP_DIR_NAME = "BambuStatus"
+
+
+def config_path():
+    """Where the printer credentials live."""
+    override = os.environ.get("BAMBU_MONITOR_CONFIG")
+    if override:
+        return Path(override)
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming"
+        return Path(base) / APP_DIR_NAME / "config.json"
+    return Path.home() / ".config" / "bambu-monitor.json"
+
+
+def state_dir():
+    """Where the monitor and the UI exchange status, commands and frames."""
+    override = os.environ.get("BAMBU_STATUS_DIR")
+    if override:
+        return Path(override)
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local"
+        return Path(base) / APP_DIR_NAME
+    return Path.home() / ".cache"
+
+
+CONF = config_path()
+DIR = state_dir()
+OUT = DIR / "bambu-status.json"
+CMD = DIR / "bambu-command"      # the UI drops a verb here
+FRAME = DIR / "bambu-frame.jpg"  # latest camera frame
+LOCK = DIR / ".bambu-monitor.lock"
 PORT = 8883
 CAM_PORT = 6000
 KEEPALIVE = 60
@@ -130,14 +163,32 @@ def clean_name(raw):
     return name.replace("_", " ").strip()
 
 
+def atomic_replace(tmp, dst, tries=4):
+    """Windows refuses to replace a file a reader still has open, and the UI
+    reads these files every second, so retry briefly instead of dying."""
+    for attempt in range(tries):
+        try:
+            tmp.replace(dst)
+            return True
+        except OSError:
+            if attempt == tries - 1:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                return False
+            time.sleep(0.05)
+
+
 def write_state(d, connected=True, error=""):
     OUT.parent.mkdir(parents=True, exist_ok=True)
     # per-pid temp file: two instances racing on one temp name make the rename
     # fail with FileNotFoundError
     tmp = OUT.with_name(f".{OUT.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(d | {"connected": connected, "error": error,
-                                   "updated": int(time.time())}))
-    tmp.replace(OUT)
+                                   "updated": int(time.time())}),
+                   encoding="utf-8")
+    atomic_replace(tmp, OUT)
 
 
 def snapshot(p, model):
@@ -163,7 +214,7 @@ def snapshot(p, model):
     }
 
 
-def run_once(conf):
+def run_once(conf, stop=None):
     host = conf["host"]
     serial = conf["serial"]
     # "name" in the config wins; otherwise derive it from the serial
@@ -178,7 +229,7 @@ def run_once(conf):
     sock = ctx.wrap_socket(raw, server_hostname=host)
     sock.settimeout(KEEPALIVE + 15)
 
-    sock.sendall(connect_packet(f"plasma-{os.getpid()}", "bblp", conf["accessCode"]))
+    sock.sendall(connect_packet(f"bambu-status-{os.getpid()}", "bblp", conf["accessCode"]))
     hdr = recv_exact(sock, 1)
     n = read_rlen(sock)
     body = recv_exact(sock, n)
@@ -196,10 +247,23 @@ def run_once(conf):
     cam = threading.Thread(target=camera_loop,
                            args=(host, conf["accessCode"], stop_cam), daemon=True)
     cam.start()
+    try:
+        pump(sock, serial, model, stop)
+    finally:
+        # without this every reconnect leaves another camera thread and another
+        # socket behind, and the widget process lives for days
+        stop_cam.set()
+        try:
+            sock.close()
+        except OSError:
+            pass
 
+
+def pump(sock, serial, model, stop=None):
+    """Read reports until the connection goes quiet or stop is set."""
     merged = {}
     last_ping = last_pushall = last_msg = time.time()
-    while True:
+    while not (stop is not None and stop.is_set()):
         now = time.time()
         if now - last_ping > KEEPALIVE - 15:
             sock.sendall(bytes([0xC0, 0x00]))
@@ -275,7 +339,7 @@ def camera_loop(host, code, stop_flag):
                 jpeg = recv_exact(sock, size)
                 tmp = FRAME.with_name(f".{FRAME.name}.{os.getpid()}.tmp")
                 tmp.write_bytes(jpeg)
-                tmp.replace(FRAME)
+                atomic_replace(tmp, FRAME)
             sock.close()
         except Exception:
             time.sleep(delay)
@@ -315,7 +379,7 @@ def reprint_payload(merged):
 def pump_commands(sock, serial, merged):
     """Forward a verb the applet wrote into the command file, then clear it."""
     try:
-        verb = CMD.read_text().strip()
+        verb = CMD.read_text(encoding="utf-8").strip()
     except OSError:
         return
     try:
@@ -336,40 +400,62 @@ def pump_commands(sock, serial, merged):
 
 
 def single_instance():
-    """Refuse to start twice: a second connection is wasteful and both would
-    fight over the status file."""
-    import fcntl
-    lock = open(Path.home() / ".cache" / ".bambu-monitor.lock", "w")
+    """Take the monitor lock, or return None if another process holds it.
+
+    A second connection is wasteful and both instances would fight over the
+    status file. The Windows widget calls this to decide whether it has to run
+    the monitor itself, so this reports rather than exits."""
+    DIR.mkdir(parents=True, exist_ok=True)
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock = open(LOCK, "a+")
     except OSError:
-        print("bambu-monitor already running", file=sys.stderr)
-        sys.exit(0)
+        return None
+    try:
+        if os.name == "nt":
+            import msvcrt
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        return None
     return lock                      # keep the handle alive for the process life
 
 
-def main():
-    Path(Path.home() / ".cache").mkdir(parents=True, exist_ok=True)
-    _lock = single_instance()
-    if not CONF.exists():
-        write_state({}, connected=False, error="missing ~/.config/bambu-monitor.json")
-        sys.exit(1)
-    conf = json.loads(CONF.read_text())
-
+def serve(conf, stop=None):
+    """Stay connected to the printer until stop is set. Returns an exit code."""
     delay = 5
-    while True:
+    while not (stop is not None and stop.is_set()):
         try:
-            run_once(conf)
+            run_once(conf, stop)
         except PermissionError as e:
             write_state({}, connected=False, error=str(e))
-            sys.exit(2)                # bad credentials — retrying is pointless
+            return 2                   # bad credentials — retrying is pointless
         except Exception as e:
             write_state({}, connected=False, error=f"{type(e).__name__}: {e}")
-            time.sleep(delay)
+            if stop is not None:
+                stop.wait(delay)
+            else:
+                time.sleep(delay)
             delay = min(delay * 2, 60)
         else:
             delay = 5
+    return 0
+
+
+def main():
+    lock = single_instance()
+    if lock is None:
+        print("bambu-monitor already running", file=sys.stderr)
+        return 0
+    if not CONF.exists():
+        write_state({}, connected=False, error=f"missing {CONF}")
+        return 1
+    conf = json.loads(CONF.read_text(encoding="utf-8-sig"))
+    return serve(conf)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
