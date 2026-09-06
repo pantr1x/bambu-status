@@ -340,7 +340,8 @@ class MonitorHost:
         self.lock = mon.single_instance()
         self.thread = None
         self.stop = None
-        self.hunted = False
+        self.hunted = 0.0               # when the last attempt ran
+        self.hunting = False
         self.external = self.lock is None
 
     def start(self):
@@ -369,26 +370,35 @@ class MonitorHost:
                                        daemon=True, name="bambu-monitor")
         self.thread.start()
 
+    HUNT_EVERY = 300                # seconds between attempts once it has failed
+
     def hunt(self):
-        """Second attempt, with the LAN listen that takes a few seconds. Runs
-        once; after that the user is better served by the setup window."""
-        if self.hunted:
+        """Try again with the LAN listen, which takes a few seconds.
+
+        Repeats slowly rather than giving up: Bambu Studio may not have been
+        installed yet, or the laptop may have been on the wrong network when
+        the widget started."""
+        if time.time() - self.hunted < self.HUNT_EVERY or self.hunting:
             return
-        self.hunted = True
+        self.hunted, self.hunting = time.time(), True
 
         def work():
-            found = mon.autoconfig(network=True)
-            if found is None:
-                mon.write_state({}, connected=False, error=mon.config_problem({}))
-            else:
-                self.start()
+            try:
+                found = mon.autoconfig(network=True)
+                if found is None:
+                    mon.write_state({}, connected=False,
+                                    error=mon.config_problem({}))
+                else:
+                    self.start()
+            finally:
+                self.hunting = False
 
         threading.Thread(target=work, daemon=True).start()
 
     def restart(self):
         if self.external:
             return
-        self.hunted = False
+        self.hunted = 0.0
         if self.stop:
             self.stop.set()
         if self.thread:
@@ -1195,6 +1205,8 @@ class BambuWidget:
     def tick(self):
         self.status.poll()
         self.needs_setup = self.check_setup()
+        if self.needs_setup and not self.monitor.thread:
+            self.monitor.hunt()         # rate limited to one attempt per 5 min
         if self.armed and time.time() - self.armed_at > 5:
             self.armed = None
         self.draw_bar()

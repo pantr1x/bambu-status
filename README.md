@@ -191,12 +191,29 @@ recording every command it is sent.
 xvfb-run -a python3 tests/test_live.py    # the whole chain, needs openssl
 xvfb-run -a python3 tests/test_setup.py   # the find-my-printer dialog
 python3 tests/test_discovery.py           # SSDP and the slicer config scan
+python3 tests/test_doctor.py              # that --doctor names the real cause
 ```
 
 `test_live.py` runs the actual widget against the fake printer and checks the
 whole chain: the printer's reports reaching the bar and the panel, camera frames
 arriving, and every button — including that `Stop` sends nothing on the first
 click and that `Print again` rebuilds the right 3mf path.
+
+## When it says offline
+
+```bash
+bambu-monitor --doctor            # Linux
+```
+```powershell
+& "$env:LOCALAPPDATA\Programs\BambuStatus\..." --doctor   # Windows, see below
+```
+
+It walks the whole chain and says which link is broken: what is in the config,
+which slicer directories were searched and what came out of them, what
+announced itself on the network, and then the connection itself — TCP, TLS,
+MQTT login — one line each. A refused socket is a wrong address or LAN mode
+being off; a rejected login is the access code. Access codes are masked in the
+output, so it is safe to paste.
 
 ## Safety
 

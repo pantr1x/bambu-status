@@ -699,6 +699,144 @@ def serve(conf, stop=None):
     return 0
 
 
+# ---------------------------------------------------------------- doctor
+def mask(secret):
+    secret = str(secret or "")
+    if not secret:
+        return "(not set)"
+    return f"{secret[:2]}…{secret[-1:]} ({len(secret)} chars)"
+
+
+def probe(host, code, timeout=6):
+    """Walk the connection the way the monitor does, reporting each step.
+
+    Every failure looks different from the outside: a refused socket is a wrong
+    address or LAN mode being off, a rejected CONNACK is the access code."""
+    out = []
+    try:
+        start = time.time()
+        raw = socket.create_connection((host, PORT), timeout=timeout)
+        out.append(f"    TCP {host}:{PORT} … open ({int((time.time() - start) * 1000)} ms)")
+    except OSError as e:
+        out.append(f"    TCP {host}:{PORT} … {type(e).__name__}: {e}")
+        out.append("      -> wrong address, printer off, or LAN mode disabled")
+        return out
+    sock = None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        sock = ctx.wrap_socket(raw, server_hostname=host)
+        sock.settimeout(timeout)
+        out.append("    TLS handshake … ok")
+    except OSError as e:
+        out.append(f"    TLS handshake … {type(e).__name__}: {e}")
+        out.append("      -> something answers on 8883, but it is not a printer")
+        return out
+    try:
+        sock.sendall(connect_packet(f"doctor-{os.getpid()}", "bblp", code))
+        hdr = recv_exact(sock, 1)
+        n = read_rlen(sock)
+        body = recv_exact(sock, n)
+        if hdr[0] >> 4 == 2 and len(body) > 1 and body[1] == 0:
+            out.append("    MQTT login … accepted — this config works")
+        else:
+            rc = body[1] if len(body) > 1 else -1
+            out.append(f"    MQTT login … rejected (code {rc})")
+            out.append("      -> wrong access code for this printer" if rc in (4, 5)
+                       else "      -> the printer refused the login")
+    except OSError as e:
+        out.append(f"    MQTT login … {type(e).__name__}: {e}")
+    finally:
+        try:
+            sock.close()
+        except (OSError, AttributeError):
+            pass
+    return out
+
+
+def cmd_doctor(args):
+    """--doctor: say exactly where the chain breaks."""
+    print("Bambu Status — doctor")
+    print()
+    print(f"  config: {CONF} {'exists' if CONF.exists() else 'MISSING'}")
+    conf = {}
+    if CONF.exists():
+        try:
+            conf = json.loads(CONF.read_text(encoding="utf-8-sig"))
+        except ValueError as e:
+            print(f"    unreadable: {e}")
+    if conf:
+        print(f"    host       {conf.get('host') or '(not set)'}")
+        print(f"    serial     {conf.get('serial') or '(not set)'}")
+        print(f"    accessCode {mask(conf.get('accessCode'))}")
+        print(f"    name       {conf.get('name') or '(not set)'}")
+    print(f"    verdict    {config_problem(conf) or 'usable'}")
+
+    print()
+    print("  Bambu Studio / OrcaSlicer:")
+    dirs = slicer_config_dirs()
+    if not dirs:
+        print("    no slicer config directory found for this user")
+    interesting = CODE_KEYS + ID_KEYS + IP_KEYS
+    for root in dirs:
+        files = [f for f in root.rglob("*")
+                 if f.is_file() and f.suffix.lower() in (".json", ".conf", ".cfg")]
+        print(f"    {root}  ({len(files)} config files)")
+        hits = []
+        for f in files:
+            try:
+                if f.stat().st_size > 4_000_000:
+                    continue
+                text = f.read_text(encoding="utf-8-sig", errors="replace").lower()
+            except OSError:
+                continue
+            if any(k in text for k in interesting):
+                hits.append(str(f.relative_to(root)))
+        if hits:
+            print(f"      {len(hits)} mention a printer, e.g. " + ", ".join(hits[:6]))
+        else:
+            print("      none mention an address, serial or access code")
+
+    printers = slicer_printers()
+    print(f"    printers read out of them: {len(printers)}")
+    for p in printers:
+        print(f"      {p['model']}  {p['host'] or 'no address'}  {p['serial']}  "
+              f"code {mask(p['accessCode'])}  name {p['name'] or '-'}")
+
+    print()
+    print("  network:")
+    if "--offline" in args:
+        print("    skipped (--offline)")
+    else:
+        live = discover(timeout=6.0)
+        print(f"    listened on {SSDP_PORTS} for 6 s — {len(live)} printer(s) announced")
+        for p in live:
+            print(f"      {p['model']}  {p['host']}  {p['serial']}")
+        if not live:
+            print("      nothing heard: another network, LAN mode off, or a "
+                  "firewall is blocking UDP 2021")
+
+    host = conf.get("host") or next((p["host"] for p in printers if p["host"]), "")
+    code = conf.get("accessCode") or next((p["accessCode"] for p in printers
+                                           if p["accessCode"]), "")
+    print()
+    print("  connection:")
+    if not host or str(host) in PLACEHOLDERS:
+        print("    skipped — no address to try")
+    else:
+        for line in probe(host, code):
+            print(line)
+
+    print()
+    print("  last state written by the monitor:")
+    try:
+        print("    " + OUT.read_text(encoding="utf-8")[:400])
+    except OSError:
+        print(f"    {OUT} does not exist — the monitor has never run")
+    return 0
+
+
 def describe(printers):
     for i, p in enumerate(printers, 1):
         print(f"  {i}. {p['model']:>8}  {p['host'] or 'address unknown':<15} "
@@ -762,10 +900,13 @@ def main():
     args = sys.argv[1:]
     if "--help" in args or "-h" in args:
         print(__doc__.strip())
-        print("\n  --detect [--offline]     list printers this machine knows of"
+        print("\n  --doctor [--offline]     say where the connection breaks"
+              "\n  --detect [--offline]     list printers this machine knows of"
               "\n  --setup [n] [--offline]  write the config from one of them"
               "\n  (no arguments)           run the monitor")
         return 0
+    if "--doctor" in args:
+        return cmd_doctor(args)
     if "--detect" in args:
         return cmd_detect(args)
     if "--setup" in args:

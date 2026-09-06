@@ -59,8 +59,9 @@ def recv_exact(sock, n):
 
 
 class FakePrinter:
-    def __init__(self, serial="01P00C612903019", frame=b""):
+    def __init__(self, serial="01P00C612903019", frame=b"", access_code="12345678"):
         self.serial = serial
+        self.access_code = access_code
         self.frame = frame
         self.commands = []           # what the widget asked the printer to do
         self.percent = 63
@@ -97,9 +98,28 @@ class FakePrinter:
             except OSError:
                 return
 
+    @staticmethod
+    def connect_password(body):
+        """Pull the password out of a CONNECT: 10 bytes of variable header,
+        then client id, username and password, each length-prefixed."""
+        pos = 10
+        fields = []
+        for _ in range(3):
+            if pos + 2 > len(body):
+                return ""
+            n = struct.unpack(">H", body[pos:pos + 2])[0]
+            fields.append(body[pos + 2:pos + 2 + n].decode("utf-8", "replace"))
+            pos += 2 + n
+        return fields[2] if len(fields) == 3 else ""
+
     def session(self, raw):
         sock = self.ctx.wrap_socket(raw, server_side=True)
-        hdr = recv_exact(sock, 1); n = read_rlen(sock); recv_exact(sock, n)   # CONNECT
+        hdr = recv_exact(sock, 1); n = read_rlen(sock)
+        body = recv_exact(sock, n)                                             # CONNECT
+        if self.connect_password(body) != self.access_code:
+            sock.sendall(bytes([0x20, 0x02, 0x00, 0x04]))     # bad credentials
+            sock.close()
+            return
         sock.sendall(bytes([0x20, 0x02, 0x00, 0x00]))                          # CONNACK ok
         threading.Thread(target=self.push_loop, args=(sock,), daemon=True).start()
         while not self.stop.is_set():
