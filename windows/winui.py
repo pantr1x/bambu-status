@@ -182,6 +182,60 @@ def taskbar():
             "edge": EDGE_BOTTOM, "autohide": False, "found": False}
 
 
+def screen_color(x, y):
+    """The colour actually on screen at that point, mica and translucency
+    included. Returns None if it cannot be read."""
+    if not IS_WINDOWS:
+        return None
+    hdc = user32.GetDC(None)
+    if not hdc:
+        return None
+    try:
+        gdi32 = ctypes.WinDLL("gdi32")
+        gdi32.GetPixel.restype = ctypes.c_uint32
+        val = gdi32.GetPixel(hdc, int(x), int(y))
+        if val == 0xFFFFFFFF:           # CLR_INVALID
+            return None
+        return "#%02x%02x%02x" % (val & 0xFF, (val >> 8) & 0xFF, (val >> 16) & 0xFF)
+    except OSError:
+        return None
+    finally:
+        user32.ReleaseDC(None, hdc)
+
+
+def taskbar_color(skip=None):
+    """Read the taskbar's real colour off the screen.
+
+    The registry only says which theme is on; what the bar actually looks like
+    depends on translucency and the wallpaper behind it. Sampling a row of
+    pixels along its top edge and taking the most common value gets the
+    background rather than an icon. `skip` is a rect (x, y, w, h) to leave out,
+    so the widget never samples itself."""
+    if not IS_WINDOWS:
+        return None
+    tb = taskbar()
+    if not tb["found"] or tb["h"] < 8:
+        return None
+    seen = {}
+    horizontal = tb["edge"] in (EDGE_TOP, EDGE_BOTTOM)
+    for i in range(1, 12):
+        if horizontal:
+            x = tb["x"] + tb["w"] * i // 12
+            y = tb["y"] + 2 if tb["edge"] == EDGE_BOTTOM else tb["y"] + tb["h"] - 3
+        else:
+            x = tb["x"] + 2
+            y = tb["y"] + tb["h"] * i // 12
+        if skip and skip[0] - 4 <= x <= skip[0] + skip[2] + 4 \
+                and skip[1] - 4 <= y <= skip[1] + skip[3] + 4:
+            continue
+        col = screen_color(x, y)
+        if col:
+            seen[col] = seen.get(col, 0) + 1
+    if not seen:
+        return None
+    return max(seen.items(), key=lambda kv: kv[1])[0]
+
+
 def work_area():
     """The screen minus the taskbar — where a window can sit without being
     covered. Used when the taskbar rect is unusable (auto-hide, mostly)."""

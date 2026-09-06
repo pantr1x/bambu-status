@@ -105,8 +105,9 @@ written when you drag the widget, and read at start:
 | `dock` | `taskbar` | `taskbar` to sit on the bar, `float` to stay at `x`/`y` |
 | `align` | `left` | which end of the taskbar to dock to |
 | `offset` | `12` | pixels from that end |
+| `chip` | `blend` | `raised` draws a visible box around it, `#rrggbb` picks the colour |
 | `theme` | `auto` | `dark` or `light` to override what Windows reports |
-| `background` | *taskbar colour* | `#rrggbb` for the chip |
+| `background` | *measured* | `#rrggbb` to override the taskbar colour it blends into |
 | `barWidth` | `100` | width of the progress bar in the chip |
 | `camera` | `true` | `false` leaves the camera out of the panel |
 
@@ -132,11 +133,32 @@ A half-open TCP connection to the printer stays readable but silent forever, so
 the daemon treats silence as the failure signal: after 60 s without a report it
 pokes the printer, after 180 s it reconnects.
 
+By default the chip takes the taskbar's own colour, read off the screen rather
+than guessed from the registry — translucency and the wallpaper decide what the
+bar actually looks like — so only the logo and the numbers show, with no box
+around them.
+
 The Windows widget is drawn by hand on a tkinter canvas — Windows has no
 supported way to put a control inside the taskbar (deskbands are gone), so it
 is a borderless always-on-top strip that keeps itself parked on the taskbar and
 tracks it when it moves. Tk cannot read JPEG, so camera frames go through GDI+
 on the way in.
+
+## Tests
+
+`tests/fake_printer.py` is a stand-in printer: MQTT over TLS on 8883 and the
+camera stream on 6000, speaking enough of both to drive the real monitor, and
+recording every command it is sent.
+
+```bash
+python3 tests/test_live.py        # needs tkinter, a display, and openssl
+xvfb-run -a python3 tests/test_live.py
+```
+
+It runs the actual widget against it and checks the whole chain: the printer's
+reports reaching the bar and the panel, camera frames arriving, and every
+button — including that `Stop` sends nothing on the first click and that
+`Print again` rebuilds the right 3mf path.
 
 ## Safety
 

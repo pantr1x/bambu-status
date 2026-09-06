@@ -69,25 +69,50 @@ def mix(a, b, t):
         for i in (0, 2, 4))
 
 
+def luminance(color):
+    c = color.lstrip("#")
+    r, g, b = (int(c[i:i + 2], 16) for i in (0, 2, 4))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
 class Theme:
-    def __init__(self, cfg):
+    """Colours for one look. `measured` is the taskbar colour read off the
+    screen — the registry only says which theme is set, not what the bar
+    actually looks like once translucency and the wallpaper are in play."""
+
+    def __init__(self, cfg, measured=None):
         sys_theme = winui.system_theme()
+        self.bar_bg = cfg.get("background") or measured or sys_theme["taskbar"]
         want = cfg.get("theme", "auto")
-        self.dark = sys_theme["dark"] if want == "auto" else (want == "dark")
-        self.bar_bg = cfg.get("background") or sys_theme["taskbar"]
+        if want != "auto":
+            self.dark = want == "dark"
+        elif measured or cfg.get("background"):
+            self.dark = luminance(self.bar_bg) < 140
+        else:
+            self.dark = sys_theme["dark"]
+
         self.text = "#ffffff" if self.dark else "#1b1b1b"
         self.dim = mix(self.text, self.bar_bg, 0.5)
         self.panel_bg = "#1c1c1c" if self.dark else "#fbfbfb"
         self.panel_line = mix(self.panel_bg, self.text, 0.16)
         self.panel_text = "#f2f2f2" if self.dark else "#1b1b1b"
         self.panel_dim = mix(self.panel_text, self.panel_bg, 0.45)
-        # the chip is what the user actually sees on the taskbar. Against the
-        # translucent Win11 bar a subtle tint disappears, so it is a clear step
-        # off the taskbar colour with a visible edge.
-        self.chip_bg = mix(self.bar_bg, "#ffffff" if self.dark else "#000000",
-                           float(cfg.get("chipContrast", 0.16)))
-        self.chip_line = mix(self.chip_bg, self.text, 0.28)
-        self.track = mix(self.chip_bg, self.text, 0.18)
+
+        # How the chip sits on the taskbar. "blend" paints it in the taskbar's
+        # own colour, so only the logo and the numbers show and there is no box
+        # around them — but the window is still solid where it matters, which
+        # is what keeps clicks and dragging working.
+        chip = cfg.get("chip", "blend")
+        if isinstance(chip, str) and chip.startswith("#"):
+            self.chip_bg, self.chip_line = chip, chip
+        elif chip == "raised":
+            self.chip_bg = mix(self.bar_bg, "#ffffff" if self.dark else "#000000",
+                               float(cfg.get("chipContrast", 0.16)))
+            self.chip_line = mix(self.chip_bg, self.text, 0.28)
+        else:
+            self.chip_bg = self.chip_line = self.bar_bg
+
+        self.track = mix(self.chip_bg, self.text, 0.22)
         self.panel_track = mix(self.panel_bg, self.panel_text, 0.14)
 
 
@@ -296,6 +321,10 @@ class MonitorHost:
         except ValueError as e:
             mon.write_state({}, connected=False, error=f"bad config: {e}")
             return
+        problem = mon.config_problem(conf)
+        if problem:
+            mon.write_state({}, connected=False, error=problem)
+            return
         self.stop = threading.Event()
         self.thread = threading.Thread(target=mon.serve, args=(conf, self.stop),
                                        daemon=True, name="bambu-monitor")
@@ -329,6 +358,7 @@ class BambuWidget:
         self.root.withdraw()
         self.scale = winui.dpi_scale()
         self.root.tk.call("tk", "scaling", self.scale * 96.0 / 72.0)
+        self.measured = None
         self.theme = Theme(self.cfg)
         self.fonts = self.make_fonts()
 
@@ -349,7 +379,7 @@ class BambuWidget:
     def load_cfg(self):
         cfg = {"dock": "taskbar", "align": "left", "offset": 12,
                "x": 40, "y": 40, "theme": "auto", "background": "",
-               "barWidth": 0, "camera": True}
+               "chip": "blend", "barWidth": 0, "camera": True}
         try:
             cfg.update(json.loads(WIDGET_CONF.read_text(encoding="utf-8")))
         except (OSError, ValueError):
@@ -385,8 +415,8 @@ class BambuWidget:
         # the Win11 taskbar is translucent mica, so a flat colour never quite
         # matches it: punch the window out and let the chip float on the real
         # taskbar instead
-        self.bar_key = (KEY_COLOR if winui.transparent_key(self.bar, KEY_COLOR)
-                        else self.theme.bar_bg)
+        self.transparent = winui.transparent_key(self.bar, KEY_COLOR)
+        self.bar_key = KEY_COLOR if self.transparent else self.theme.bar_bg
         self.bar.configure(bg=self.bar_key)
         self.bar_canvas = tk.Canvas(self.bar, highlightthickness=0, bd=0,
                                     bg=self.bar_key)
@@ -503,12 +533,33 @@ class BambuWidget:
         self.bar_x, self.bar_y = x, y
         self.bar.geometry(f"{w}x{h}+{x}+{y}")
 
+    def resample(self):
+        """Follow the taskbar's colour: themes, accent colours and wallpapers
+        all change it, and a chip that is meant to blend has to keep up."""
+        skip = (getattr(self, "bar_x", 0), getattr(self, "bar_y", 0),
+                getattr(self, "bar_w", 0), getattr(self, "bar_h", 0))
+        measured = winui.taskbar_color(skip=skip)
+        if not measured or measured == self.measured:
+            return
+        self.measured = measured
+        was_dark = self.theme.dark
+        self.theme = Theme(self.cfg, measured)
+        if not self.transparent:
+            self.bar_key = self.theme.bar_bg
+            self.bar.configure(bg=self.bar_key)
+            self.bar_canvas.configure(bg=self.bar_key)
+        if self.panel and was_dark != self.theme.dark and not self.panel.winfo_viewable():
+            self.panel.destroy()        # rebuilt with the new colours on demand
+            self.panel = None
+        self.draw_bar()
+
     def reposition(self):
         """Explorer moves the taskbar and demotes topmost windows; re-assert."""
         if self.drag:                   # never yank the bar out of a drag
             self.root.after(2000, self.reposition)
             return
         self.place_bar()
+        self.resample()
         winui.keep_on_top(winui.hwnd_of(self.bar))
         if self.panel and self.panel.winfo_viewable():
             self.place_panel()
@@ -597,7 +648,7 @@ class BambuWidget:
 
     def reload(self):
         self.cfg = self.load_cfg()
-        self.theme = Theme(self.cfg)
+        self.theme = Theme(self.cfg, self.measured)
         self.bar.configure(bg=self.theme.bar_bg)
         self.bar_canvas.configure(bg=self.theme.bar_bg)
         if self.panel:
@@ -923,6 +974,8 @@ def diagnose():
         ("work area", winui.work_area()),
         ("dark theme", app.theme.dark),
         ("taskbar colour", app.theme.bar_bg),
+        ("measured", app.measured or "(not sampled)"),
+        ("chip mode", app.cfg.get("chip", "blend")),
         ("chip colour", app.theme.chip_bg),
         ("transparency", app.bar_key != app.theme.bar_bg),
         ("bar asked for", (app.bar_x, app.bar_y, app.bar_w, app.bar_h)),

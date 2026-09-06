@@ -214,6 +214,25 @@ def snapshot(p, model):
     }
 
 
+PLACEHOLDERS = {"192.168.0.000", "PUT-YOUR-SERIAL-HERE", "00000000", "", None}
+
+
+def config_problem(conf):
+    """Say what is still missing, in words worth showing a user.
+
+    Without this the template config just produces a DNS error, which explains
+    nothing to somebody who has not filled the file in yet."""
+    if not isinstance(conf, dict):
+        return "config is not a JSON object"
+    missing = [k for k in ("host", "serial", "accessCode")
+               if str(conf.get(k, "")).strip() in PLACEHOLDERS]
+    if missing:
+        return ("still the example config — fill in "
+                + ", ".join(missing)
+                + " (printer screen: Settings → WLAN)")
+    return None
+
+
 def run_once(conf, stop=None):
     host = conf["host"]
     serial = conf["serial"]
@@ -454,6 +473,10 @@ def main():
         write_state({}, connected=False, error=f"missing {CONF}")
         return 1
     conf = json.loads(CONF.read_text(encoding="utf-8-sig"))
+    problem = config_problem(conf)
+    if problem:
+        write_state({}, connected=False, error=problem)
+        return 1
     return serve(conf)
 
 
