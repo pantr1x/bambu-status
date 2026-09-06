@@ -59,9 +59,15 @@ def recv_exact(sock, n):
 
 
 class FakePrinter:
-    def __init__(self, serial="01P00C612903019", frame=b"", access_code="12345678"):
+    """Stands in for the printer on the LAN, and — with cloud=True — for
+    Bambu's own broker, which is the same MQTT with the account token as the
+    password instead of the printer's access code."""
+
+    def __init__(self, serial="01P00C612903019", frame=b"", access_code="12345678",
+                 cloud_token=None):
         self.serial = serial
         self.access_code = access_code
+        self.cloud_token = cloud_token
         self.frame = frame
         self.commands = []           # what the widget asked the printer to do
         self.percent = 63
@@ -119,7 +125,9 @@ class FakePrinter:
             return          # a port scan connects and drops without a handshake
         hdr = recv_exact(sock, 1); n = read_rlen(sock)
         body = recv_exact(sock, n)                                             # CONNECT
-        if self.connect_password(body) != self.access_code:
+        password = self.connect_password(body)
+        allowed = [self.access_code] + ([self.cloud_token] if self.cloud_token else [])
+        if password not in allowed:
             sock.sendall(bytes([0x20, 0x02, 0x00, 0x04]))     # bad credentials
             sock.close()
             return
@@ -186,3 +194,47 @@ class FakePrinter:
                 s.close()
             except OSError:
                 pass
+
+
+class FakeAccount:
+    """Bambu's bind endpoint, as far as the monitor cares: hand it a token,
+    get the printers back. Plain HTTP on loopback — the real one is HTTPS with
+    a verified certificate, which is not something a test can stand in for."""
+
+    def __init__(self, token="ey.test.token", serial="01P00C612903019",
+                 access_code="12345678", name="Dielna P1S"):
+        import http.server
+
+        self.token = token
+        self.requests = []
+        devices = [{"dev_id": serial, "name": name, "online": True,
+                    "dev_model_name": "C12", "dev_access_code": access_code}]
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                auth = self.headers.get("Authorization", "")
+                outer.requests.append(auth)
+                if auth != f"Bearer {outer.token}":
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                body = json.dumps({"message": "success", "code": None,
+                                   "devices": devices}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_port}/v1/iot-service/api/user/bind"
+
+    def start(self):
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def shutdown(self):
+        self.server.shutdown()

@@ -89,6 +89,27 @@ def run():
     app.needs_setup = app.check_setup()
     check("setup no longer offered", not app.needs_setup)
 
+    # --- a printer with no address on this network, reached through the account
+    (D / "config.json").unlink()
+    app.open_setup()
+    dlg2 = app.setup
+    dlg2.found = [{"serial": "01P00C612903019", "host": "", "accessCode": "",
+                   "name": "Dielna P1S", "model": "P1S", "mode": "cloud",
+                   "token": "ey.a.token", "source": "your Bambu account"}]
+    dlg2.fill_list()
+    dlg2.list.selection_set(0)
+    dlg2.pick()
+    dlg2.save()
+    cloud_conf = json.loads((D / "config.json").read_text())
+    check("saved without an address", not cloud_conf.get("host"), cloud_conf)
+    check("saved as cloud mode", cloud_conf.get("mode") == "cloud", cloud_conf)
+    check("kept the token that reaches it", cloud_conf.get("token") == "ey.a.token")
+    check("the monitor accepts a cloud config",
+          bw.mon.config_problem(cloud_conf) is None,
+          bw.mon.config_problem(cloud_conf))
+    check("cloud config picks the cloud transport",
+          bw.mon.transport(cloud_conf) is bw.mon.run_once_cloud)
+
     # and the monitor agrees the config is usable now
     check("monitor accepts the config", bw.mon.config_problem(conf) is None,
           bw.mon.config_problem(conf))

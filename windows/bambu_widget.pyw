@@ -312,6 +312,10 @@ class Status:
         return self.data.get("error") or ""
 
     @property
+    def cloud(self):
+        return self.data.get("mode") == "cloud"
+
+    @property
     def stale(self):
         up = self.data.get("updated") or 0
         return bool(self.connected and up and time.time() - up > 90)
@@ -456,6 +460,9 @@ class SetupDialog:
 
         row = ttk.Frame(frm)
         row.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        self.account_btn = ttk.Button(row, text="Use my Bambu account",
+                                      command=self.use_account)
+        self.account_btn.pack(side="left", padx=(0, 6))
         self.search_btn = ttk.Button(row, text="Search again", command=self.search)
         self.search_btn.pack(side="left", padx=(0, 6))
         ttk.Button(row, text="Cancel", command=self.close).pack(side="left", padx=(0, 6))
@@ -527,6 +534,38 @@ class SetupDialog:
             self.list.selection_set(0)
             self.pick()
 
+    def use_account(self):
+        """Watch the printer through Bambu's own broker, which is what the
+        Bambu app does — and the only thing that works when the printer is on
+        a network this machine cannot reach."""
+        self.account_btn.state(["disabled"])
+        self.note.set("Asking your Bambu account…")
+        result = {}
+
+        def work():
+            result["printers"], result["note"] = mon.account_printers()
+
+        thread = threading.Thread(target=work, daemon=True)
+        thread.start()
+
+        def poll():
+            if thread.is_alive():
+                self.win.after(300, poll)
+                return
+            self.account_btn.state(["!disabled"])
+            self.note.set(result.get("note", "the account said nothing"))
+            printers = result.get("printers") or []
+            if not printers:
+                return
+            self.found = printers + [p for p in self.found
+                                     if p["serial"] not in
+                                     {q["serial"] for q in printers}]
+            self.fill_list()
+            self.list.selection_set(0)
+            self.pick()
+
+        self.win.after(300, poll)
+
     def pick(self, _event=None):
         idx = self.list.curselection()
         if not idx or idx[0] >= len(self.found):
@@ -550,6 +589,20 @@ class SetupDialog:
         conf.update({"host": self.host.get().strip(),
                      "serial": self.serial.get().strip(),
                      "accessCode": self.code.get().strip()})
+
+        # a printer that came from the account carries the token that reaches
+        # it; without an address on this network that is the only way in
+        picked = next((p for p in self.found
+                       if p["serial"] == conf["serial"] and p.get("token")), None)
+        if picked:
+            conf["token"] = picked["token"]
+            if picked.get("name"):
+                conf.setdefault("name", picked["name"])
+        if picked and not mon.plausible_host(conf["host"]):
+            conf["mode"] = "cloud"
+        elif conf.get("mode") == "cloud" and mon.plausible_host(conf["host"]):
+            conf["mode"] = "auto"       # reachable now: prefer the LAN again
+
         problem = mon.config_problem(conf)
         if problem:
             self.note.set(problem)
@@ -1085,6 +1138,15 @@ class BambuWidget:
     def draw_camera(self, c, x0, y0, x1, y1):
         t = self.theme
         rrect(c, x0, y0, x1, y1, self.px(10), mix(t.panel_bg, "#000000", 0.45))
+        if self.status.cloud:
+            # the camera stream is a LAN-only protocol on the printer's own
+            # port 6000; through the account there is nothing to show
+            for i, line in enumerate(("watching through your Bambu account",
+                                      "the camera needs the printer's network")):
+                c.create_text((x0 + x1) / 2, (y0 + y1) / 2 + (i - 0.5) * self.u(1),
+                              text=line, anchor="c", font=self.fonts["small"],
+                              fill=t.panel_dim)
+            return
         img = self.camera_image(int(x1 - x0), int(y1 - y0))
         if img:
             self.cam_image = img        # Tk only keeps a weak grip on images

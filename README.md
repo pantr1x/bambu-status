@@ -8,6 +8,10 @@ stop / reprint in the popup.
 Talks to the printer directly over **LAN mode MQTT** — no cloud account, no
 account credentials, nothing leaves your network.
 
+If the printer is not on the same network as the machine you are sitting at,
+there is a second way in: the Bambu account, the same one the Bambu app uses.
+See [Cloud mode](#cloud-mode).
+
 ![panel](docs/panel.png)
 
 ## What it shows
@@ -141,7 +145,8 @@ written when you drag the widget, and read at start:
 ## How it works
 
 `bambu-monitor` is a small daemon — a systemd user service on Linux, a thread
-inside the widget on Windows:
+inside the widget on Windows. Both transports below it speak the same MQTT with
+the same topics, so only the socket differs:
 
 - speaks just enough MQTT 3.1.1 over TLS (CONNECT / SUBSCRIBE / PUBLISH /
   PINGREQ) to avoid pulling in a dependency that would need root to install
@@ -183,6 +188,34 @@ is a borderless always-on-top strip that keeps itself parked on the taskbar and
 tracks it when it moves. Tk cannot read JPEG, so camera frames go through GDI+
 on the way in.
 
+## Cloud mode
+
+The LAN path needs the printer on your network. When it is not — a different
+WiFi, a different site — the printer can still be watched the way the Bambu app
+watches it: through Bambu's own MQTT broker, with the account Bambu Studio is
+signed in to.
+
+Nothing to set up. The monitor finds the account token Bambu Studio saved, asks
+the account which printers are bound to it, and connects. `mode` in the config
+says which path to take:
+
+| `mode` | meaning |
+|---|---|
+| `auto` | *(default)* the LAN when there is a usable address and access code, the account otherwise |
+| `lan` | only the printer's own address |
+| `cloud` | only the account |
+
+What you get is the same panel: state, job, progress, remaining time, layers,
+temperatures, and pause / resume / stop / print again. What you do not get is
+the **camera** — that stream is a LAN-only protocol on the printer's own port
+6000, and no account reaches it. The panel says so in place of the picture.
+
+About the token: it is read from Bambu Studio's own config, sent only to Bambu's
+own service over TLS (verified, unlike the printer's self-signed LAN
+certificate), never written to the status file and masked wherever the
+diagnostics print anything. It ends up in `config.json`, which is created mode
+`600`.
+
 ## Tests
 
 `tests/fake_printer.py` is a stand-in printer: MQTT over TLS on 8883 and the
@@ -195,6 +228,7 @@ xvfb-run -a python3 tests/test_setup.py   # the find-my-printer dialog
 python3 tests/test_discovery.py           # SSDP and the slicer config scan
 python3 tests/test_doctor.py              # that --doctor names the real cause
 python3 tests/test_validation.py          # what may be believed, and the LAN scan
+python3 tests/test_cloud.py               # the account path, against a fake broker
 ```
 
 `test_live.py` runs the actual widget against the fake printer and checks the

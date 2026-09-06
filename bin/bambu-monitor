@@ -20,8 +20,11 @@ everything below has to stay importable and free of side effects.
 import json
 import os
 import re
+import base64
 import socket
 import ssl
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 import struct
 import sys
@@ -67,6 +70,10 @@ KEEPALIVE = 60
 # only these may be sent to the printer; anything else in the command file is
 # ignored rather than forwarded
 ALLOWED_COMMANDS = ("pause", "resume", "stop", "reprint")
+
+# which transport is carrying the current connection, so the UI can say why
+# there is no camera when the printer is being watched through the account
+ACTIVE_MODE = "lan"
 
 
 # ---------------------------------------------------------------- MQTT bits
@@ -188,6 +195,7 @@ def write_state(d, connected=True, error=""):
     # fail with FileNotFoundError
     tmp = OUT.with_name(f".{OUT.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(d | {"connected": connected, "error": error,
+                                   "mode": ACTIVE_MODE,
                                    "updated": int(time.time())}),
                    encoding="utf-8")
     atomic_replace(tmp, OUT)
@@ -226,6 +234,19 @@ def config_problem(conf):
     nothing to somebody who has not filled the file in yet."""
     if not isinstance(conf, dict):
         return "config is not a JSON object"
+
+    serial = str(conf.get("serial", "")).strip()
+    # a cloud config asks for different things: the account stands in for the
+    # address and the access code, neither of which reaches off the LAN anyway
+    if str(conf.get("mode") or "").lower() == "cloud" or (
+            conf.get("token") and not conf.get("host")):
+        if not looks_like_serial(serial):
+            return "that serial does not look like a printer's"
+        if not str(conf.get("token") or "").strip():
+            return ("no Bambu account token — sign in to Bambu Studio, or use "
+                    "the printer's own address instead")
+        return None
+
     missing = [k for k in ("host", "serial", "accessCode")
                if str(conf.get(k, "")).strip() in PLACEHOLDERS]
     if missing:
@@ -410,7 +431,9 @@ ID_KEYS = ("dev_id", "device_id", "serial", "serial_number", "sn", "usn",
 IP_KEYS = ("dev_ip", "ip", "host", "hostname", "printer_ip", "dev_address",
            "lan_ip", "ip_address", "addr", "address", "device_ip")
 NAME_KEYS = ("dev_name", "device_name", "printer_name", "dev_alias", "alias",
-             "nickname", "machine_name")
+             "nickname", "machine_name", "name")
+# "name" is only safe in that list because a record must carry a serial to
+# qualify at all — which every preset in a slicer's library lacks
 
 
 def slicer_config_dirs():
@@ -619,7 +642,120 @@ def slicer_serials():
     return seen
 
 
-def autodetect(timeout=6.0, network=True, scan=None, incomplete=False):
+# ---------------------------------------------------------------- the account
+# A printer that is not on this network can still be watched: the Bambu app
+# does it every day, through Bambu's own MQTT broker rather than the LAN. That
+# needs the account, and Bambu Studio is already signed in to it.
+BIND_URL = "https://api.bambulab.com/v1/iot-service/api/user/bind"
+CLOUD_BROKER = "{region}.mqtt.bambulab.com"
+CLOUD_REGIONS = ("us", "eu", "cn")
+TOKEN_KEYS = ("access_token", "accesstoken", "token", "user_token",
+              "bambu_token", "refresh_token")
+
+
+def slicer_tokens():
+    """Account tokens the slicer has stored, JWTs first, then longest."""
+    found = []
+
+    def walk(node, depth=0):
+        if depth > 12:
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if (str(key).lower() in TOKEN_KEYS and isinstance(value, str)
+                        and len(value) > 40):
+                    found.append(value.strip())
+                else:
+                    walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node[:50]:
+                walk(item, depth + 1)
+
+    for root in slicer_config_dirs():
+        for _path, blob in slicer_files(root):
+            try:
+                walk(json.loads(blob.decode("utf-8-sig", "replace")))
+            except (ValueError, RecursionError):
+                continue
+    return sorted(set(found), key=lambda t: (not t.startswith("ey"), -len(t)))
+
+
+def jwt_claims(token):
+    """The payload of a JWT, unverified — we only want the username claim,
+    which is the account's MQTT login."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+    except (IndexError, ValueError, UnicodeDecodeError):
+        return {}
+
+
+def cloud_username(token):
+    claims = jwt_claims(token)
+    for key in ("username", "preferred_username", "sub", "uid"):
+        value = claims.get(key)
+        if isinstance(value, str) and value:
+            return value if value.startswith("u_") else f"u_{value}"
+    return ""
+
+
+def cloud_devices(token, url=None, timeout=10):
+    """Printers bound to this account. Returns (printers, note)."""
+    req = urllib.request.Request(url or BIND_URL, headers={
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "bambu-status",
+        "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return [], ("the account token has expired — sign in to Bambu "
+                        "Studio again and it will be picked up")
+        return [], f"the account service answered {e.code}"
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return [], f"could not reach the account service: {type(e).__name__}"
+
+    # Bambu has renamed these fields before, so harvest rather than assume
+    out = {}
+    _walk(body, out)
+    printers = list(out.values())
+    if not printers:
+        for entry in (body.get("devices") if isinstance(body, dict) else None) or []:
+            if isinstance(entry, dict):
+                serial = str(entry.get("dev_id") or entry.get("dev_sn") or "")
+                if looks_like_serial(serial):
+                    printers.append({
+                        "serial": serial, "host": "",
+                        "accessCode": str(entry.get("dev_access_code") or ""),
+                        "name": str(entry.get("name") or ""),
+                        "model": model_from_serial(serial)})
+    if not printers:
+        return [], "the account answered, but named no printer we could read"
+    for p in printers:
+        p["token"] = token
+    return printers, f"{len(printers)} printer(s) on your Bambu account"
+
+
+def account_printers():
+    """Try each stored token until one answers. Returns (printers, note)."""
+    tokens = slicer_tokens()
+    if not tokens:
+        return [], "no Bambu Studio account token on this machine"
+    note = ""
+    for token in tokens[:3]:
+        printers, note = cloud_devices(token)
+        if printers:
+            for p in printers:
+                p["source"] = "your Bambu account"
+                p["mode"] = "cloud"
+            return printers, note
+    return [], note
+
+
+def autodetect(timeout=6.0, network=True, scan=None, incomplete=False,
+               account=True):
     """Every printer this machine knows about.
 
     The slicer's own settings come first and need no network at all; a printer
@@ -629,6 +765,20 @@ def autodetect(timeout=6.0, network=True, scan=None, incomplete=False):
     for p in slicer_printers():
         p["source"] = "Bambu Studio"
         known[p["serial"]] = p
+
+    # A printer the slicer saved nothing usable about is not a dead end: it may
+    # be bound to the account, which is how the Bambu app watches a printer on
+    # a network this machine cannot reach.
+    if account and not any(p["accessCode"] and p["host"] for p in known.values()):
+        for p in account_printers()[0]:
+            saved = known.get(p["serial"])
+            if saved:
+                saved.update({k: v for k, v in p.items()
+                              if v and k in ("accessCode", "name", "token", "mode")})
+                saved["source"] += " · through your Bambu account"
+            else:
+                known[p["serial"]] = p
+
     if network:
         for live in discover(timeout):
             saved = known.get(live["serial"])
@@ -696,7 +846,11 @@ def autoconfig(network=False):
         live = [p for p in ready if "network" in p.get("source", "")]
         ready = live if len(live) == 1 else ready
     if len(ready) != 1:
-        return None
+        # nothing reachable on the LAN, but the account may still hold a
+        # printer we can watch through Bambu's own broker
+        ready = [p for p in printers if p.get("mode") == "cloud" and p.get("token")]
+        if len(ready) != 1:
+            return None
 
     chosen = ready[0]
     conf = {}
@@ -705,7 +859,9 @@ def autoconfig(network=False):
             conf = json.loads(CONF.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             conf = {}
-    conf.update({k: chosen[k] for k in ("host", "serial", "accessCode")})
+    for field in ("host", "serial", "accessCode", "token", "mode"):
+        if chosen.get(field):
+            conf[field] = chosen[field]
     if chosen.get("name"):
         conf["name"] = chosen["name"]      # what the user calls it in the app
     if config_problem(conf):
@@ -720,6 +876,8 @@ def autoconfig(network=False):
 
 
 def run_once(conf, stop=None):
+    global ACTIVE_MODE
+    ACTIVE_MODE = "lan"
     host = conf["host"]
     serial = conf["serial"]
     # "name" in the config wins; otherwise derive it from the serial
@@ -758,6 +916,74 @@ def run_once(conf, stop=None):
         # without this every reconnect leaves another camera thread and another
         # socket behind, and the widget process lives for days
         stop_cam.set()
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def cloud_context():
+    """Unlike the printer on the LAN, Bambu's broker is a real service with a
+    real certificate, so this one is verified."""
+    return ssl.create_default_context()
+
+
+def cloud_connect(conf, region, timeout=15):
+    """One attempt at Bambu's broker for that region. Returns a live socket."""
+    token = conf.get("token") or ""
+    user = conf.get("cloudUser") or cloud_username(token)
+    if not token or not user:
+        raise PermissionError("no usable Bambu account token")
+
+    host = CLOUD_BROKER.format(region=region)
+    ctx = cloud_context()
+    raw = socket.create_connection((host, PORT), timeout=timeout)
+    sock = ctx.wrap_socket(raw, server_hostname=host)
+    sock.settimeout(KEEPALIVE + 15)
+    try:
+        sock.sendall(connect_packet(f"bambu-status-{os.getpid()}", user, token))
+        hdr = recv_exact(sock, 1)
+        n = read_rlen(sock)
+        body = recv_exact(sock, n)
+        if hdr[0] >> 4 != 2 or len(body) < 2 or body[1] != 0:
+            code = body[1] if len(body) > 1 else -1
+            raise PermissionError(f"{host} rejected the account, code {code}")
+    except Exception:
+        sock.close()
+        raise
+    return sock
+
+
+def run_once_cloud(conf, stop=None):
+    """Watch the printer through the Bambu account instead of the LAN.
+
+    Same MQTT, same topics, same reports, so everything from pump() down is
+    shared with the LAN path. What is not shared is the camera: that protocol
+    only exists on the printer's own network."""
+    global ACTIVE_MODE
+    serial = conf["serial"]
+    model = conf.get("name") or conf.get("model") or model_from_serial(serial)
+    ACTIVE_MODE = "cloud"
+
+    regions = [conf["region"]] if conf.get("region") else list(CLOUD_REGIONS)
+    sock, used, last = None, "", None
+    for region in regions:
+        try:
+            sock, used = cloud_connect(conf, region), region
+            break
+        except (PermissionError, OSError) as e:
+            last = e                    # the wrong region rejects the login too
+    if sock is None:
+        raise last or ConnectionError("no Bambu region answered")
+
+    conf["region"] = used               # remember which one worked
+    try:
+        sock.sendall(subscribe_packet(f"device/{serial}/report"))
+        sock.sendall(publish_packet(
+            f"device/{serial}/request",
+            json.dumps({"pushing": {"sequence_id": "1", "command": "pushall"}})))
+        pump(sock, serial, model, stop)
+    finally:
         try:
             sock.close()
         except OSError:
@@ -929,12 +1155,24 @@ def single_instance():
     return lock                      # keep the handle alive for the process life
 
 
+def transport(conf):
+    """The LAN when there is a printer to reach on it, the account otherwise."""
+    mode = str(conf.get("mode") or "auto").lower()
+    if mode == "cloud":
+        return run_once_cloud
+    if mode == "lan":
+        return run_once
+    lan_ready = (plausible_host(conf.get("host"))
+                 and plausible_code(conf.get("accessCode")))
+    return run_once if lan_ready else run_once_cloud
+
+
 def serve(conf, stop=None):
     """Stay connected to the printer until stop is set. Returns an exit code."""
     delay = 5
     while not (stop is not None and stop.is_set()):
         try:
-            run_once(conf, stop)
+            transport(conf)(conf, stop)
         except PermissionError as e:
             write_state({}, connected=False, error=str(e))
             return 2                   # bad credentials — retrying is pointless
@@ -1209,6 +1447,24 @@ def cmd_doctor(args):
               f"code {mask(p['accessCode'])}  name {p['name'] or '-'}")
 
     print()
+    print("  your Bambu account:")
+    tokens = slicer_tokens()
+    if not tokens:
+        print("    no account token saved by Bambu Studio — sign in to it, and"
+              " the printer can be watched without being on its network")
+    else:
+        who = cloud_username(tokens[0])
+        print(f"    token found: {mask(tokens[0])}, account {who or 'unknown'}")
+        if "--offline" in args:
+            print("    not asking the account service (--offline)")
+        else:
+            printers, note = account_printers()
+            print(f"    {note}")
+            for p in printers:
+                print(f"      {p['model']}  {p['serial']}  "
+                      f"code {mask(p['accessCode'])}  name {p['name'] or '-'}")
+
+    print()
     print("  network:")
     if "--offline" in args:
         print("    skipped (--offline)")
@@ -1237,10 +1493,27 @@ def cmd_doctor(args):
     print()
     print("  connection:")
     if not host or str(host) in PLACEHOLDERS:
-        print("    skipped — no address to try")
+        print("    no address to try on the LAN")
     else:
         for line in probe(host, code):
             print(line)
+
+    token = conf.get("token") or (tokens[0] if tokens else "")
+    serial = conf.get("serial") or ""
+    if token and looks_like_serial(serial) and "--offline" not in args:
+        print("    through the account:")
+        for region in CLOUD_REGIONS:
+            try:
+                sock = cloud_connect({"token": token, "serial": serial}, region)
+                sock.close()
+                print(f"      {CLOUD_BROKER.format(region=region)} … accepted"
+                      " — the printer can be watched from here")
+                break
+            except PermissionError as e:
+                print(f"      {CLOUD_BROKER.format(region=region)} … {e}")
+            except OSError as e:
+                print(f"      {CLOUD_BROKER.format(region=region)} … "
+                      f"{type(e).__name__}")
 
     print()
     print("  last state written by the monitor:")
