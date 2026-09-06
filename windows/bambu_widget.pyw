@@ -482,7 +482,7 @@ class SetupDialog:
         """Bambu Studio's own settings first — that needs no network and is
         instant — then the LAN broadcast on top of it."""
         self.search_btn.state(["disabled"])
-        self.found = mon.autodetect(network=False)
+        self.found = mon.autodetect(network=False, incomplete=True)
         if self.found:
             ready = sum(1 for p in self.found if p["host"] and p["accessCode"])
             self.note.set(f"Found {len(self.found)} in your Bambu slicer"
@@ -495,7 +495,8 @@ class SetupDialog:
 
         result = []
         thread = threading.Thread(
-            target=lambda: result.extend(mon.autodetect(6.0)), daemon=True)
+            target=lambda: result.extend(
+                mon.autodetect(6.0, incomplete=True)), daemon=True)
         thread.start()
 
         def poll():

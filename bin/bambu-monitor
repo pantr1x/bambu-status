@@ -607,7 +607,19 @@ def slicer_access_codes():
             for p in slicer_printers() if p["accessCode"]}
 
 
-def autodetect(timeout=6.0, network=True, scan=None):
+def slicer_serials():
+    """Serials mentioned anywhere in the slicer's files, even where nothing
+    else about the printer was saved. Enough to fill a field in for someone."""
+    seen = []
+    for root in slicer_config_dirs():
+        for _path, blob in slicer_files(root):
+            for found in SERIAL_RE.findall(blob.decode("utf-8", "replace")):
+                if found not in seen:
+                    seen.append(found)
+    return seen
+
+
+def autodetect(timeout=6.0, network=True, scan=None, incomplete=False):
     """Every printer this machine knows about.
 
     The slicer's own settings come first and need no network at all; a printer
@@ -655,6 +667,15 @@ def autodetect(timeout=6.0, network=True, scan=None):
                 "name": lone["name"] if lone else "",
                 "model": lone["model"] if lone else "Bambu",
                 "source": "answers on 8883, access code needed"}
+
+    # a serial the slicer knows but nothing else about: worth offering, since
+    # it is one field the user then does not have to copy off the printer
+    if incomplete:
+        for serial in slicer_serials():
+            if serial not in known:
+                known[serial] = {"serial": serial, "host": "", "accessCode": "",
+                                 "name": "", "model": model_from_serial(serial),
+                                 "source": "seen in Bambu Studio, nothing else saved"}
 
     # the ones that are ready to use first
     return sorted(known.values(),
