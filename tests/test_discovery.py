@@ -77,6 +77,23 @@ if "01P00C612903019" in printers:
 check("printer keyed by serial also read", "00M09A123456789" in printers, list(printers))
 check("presets are not mistaken for printers", len(printers) == 2, list(printers))
 
+# --- layouts nobody has seen before: fields named differently, and not JSON
+odd = pathlib.Path(tempfile.mkdtemp(prefix="oddhome-"))
+(odd / ".config" / "BambuStudio").mkdir(parents=True)
+(odd / ".config" / "BambuStudio" / "BambuStudio.conf").write_text(json.dumps(
+    {"machine": {"01P00C612903019": {"printer_name": "Dielna P1S",
+                                     "printer_ip": "192.168.0.102",
+                                     "lan_code": "87654321"}}}))
+(odd / ".config" / "BambuStudio" / "devices.dat").write_text(
+    "[device]\nsn=00M09A123456789\naddr=192.168.0.77\npasscode=11112222\n")
+os.environ["HOME"] = str(odd)
+odd_found = {p["serial"]: p for p in mon.slicer_printers()}
+check("unfamiliar field names still read",
+      odd_found.get("01P00C612903019", {}).get("accessCode") == "87654321", odd_found)
+check("a store that is not JSON still reads",
+      odd_found.get("00M09A123456789", {}).get("host") == "192.168.0.77", odd_found)
+os.environ["HOME"] = str(home)
+
 # --- and it all works with no network at all
 offline = mon.autodetect(network=False)
 check("autodetect works offline", len(offline) == 2, offline)

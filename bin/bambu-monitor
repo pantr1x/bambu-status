@@ -317,12 +317,20 @@ def discover(timeout=6.0):
 # those files has moved around between releases, so rather than pin one schema
 # this walks the config tree for anything that looks like a saved printer.
 SLICER_DIRS = ("BambuStudio", "OrcaSlicer", "BambuNetworkEngine",
-               "bambu-studio", "OrcaSlicer-nightly")
-CODE_KEYS = ("access_code", "accesscode", "dev_access_code", "printer_access_code",
-             "lan_access_code")
-ID_KEYS = ("dev_id", "device_id", "serial", "sn", "usn", "printer_sn", "dev_sn")
-IP_KEYS = ("dev_ip", "ip", "host", "printer_ip", "dev_address", "lan_ip")
-NAME_KEYS = ("dev_name", "device_name", "printer_name", "dev_alias")
+               "bambu-studio", "OrcaSlicer-nightly", "Bambu Studio",
+               "BambuNetworkPlugin", "Bambu Network Plugin", "bambustudio")
+# Field names vary by release and by fork, so keep the net wide. What stops
+# this from picking up nonsense is not the names — it is the rule in _record()
+# that the same object must also carry something shaped like a Bambu serial.
+CODE_KEYS = ("access_code", "accesscode", "access-code", "dev_access_code",
+             "printer_access_code", "lan_access_code", "lan_code", "passcode",
+             "pass_code", "printer_code", "device_code", "code")
+ID_KEYS = ("dev_id", "device_id", "serial", "serial_number", "sn", "usn",
+           "printer_sn", "dev_sn", "printer_id", "machine_id", "dev_serial")
+IP_KEYS = ("dev_ip", "ip", "host", "hostname", "printer_ip", "dev_address",
+           "lan_ip", "ip_address", "addr", "address", "device_ip")
+NAME_KEYS = ("dev_name", "device_name", "printer_name", "dev_alias", "alias",
+             "nickname", "machine_name")
 
 
 def slicer_config_dirs():
@@ -359,10 +367,15 @@ def _record(node, key_serial=None):
     def first(keys):
         return next((flat[k] for k in keys if flat.get(k)), "")
 
-    serial = first(ID_KEYS) or (key_serial or "")
+    # a serial and an address give themselves away by their shape, so when the
+    # field names are ones we have never seen, go by that instead. Not the
+    # access code though — guessing at a credential is worse than not having it
+    serial = (first(ID_KEYS) or key_serial or
+              next((v for v in flat.values() if SERIAL_RE.fullmatch(v)), ""))
     if not looks_like_serial(serial):
         return None
-    code, host = first(CODE_KEYS), first(IP_KEYS)
+    code = first(CODE_KEYS)
+    host = first(IP_KEYS) or next((v for v in flat.values() if IPV4_RE.fullmatch(v)), "")
     if not code and not host:
         return None
     return {"serial": serial, "accessCode": code, "host": host,
@@ -384,6 +397,12 @@ def _walk(node, out, key_serial=None):
             _walk(item, out, key_serial)
 
 
+# A Bambu serial always starts with one of the model prefixes, which makes it
+# findable in a file whose key names mean nothing to us.
+SERIAL_RE = re.compile(
+    r"\b(?:" + "|".join(SERIAL_MODELS) + r")[0-9A-Z]{9,17}\b")
+IPV4_RE = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}")
+
 # a slicer install is mostly vendor presets and an embedded browser's cache;
 # neither has ever held a device record, and there are thousands of them
 SKIP_PARTS = {"webview2cache", "cache", "caches", "logs", "log", "crashreports",
@@ -402,7 +421,8 @@ def slicer_files(root, limit_bytes=4_000_000, limit=1200):
         # to the user and may well contain a word like "tmp"
         if any(part.lower() in SKIP_PARTS for part in path.relative_to(root).parts):
             continue
-        if path.suffix.lower() not in (".json", ".conf", ".cfg"):
+        if path.suffix.lower() not in ("", ".json", ".conf", ".cfg", ".ini",
+                                       ".dat", ".txt", ".config"):
             continue
         try:
             if not path.is_file() or path.stat().st_size > limit_bytes:
@@ -414,6 +434,30 @@ def slicer_files(root, limit_bytes=4_000_000, limit=1200):
         low = blob.lower()
         if any(m in low for m in MARKERS):
             yield path, blob
+        elif SERIAL_RE.search(blob.decode("utf-8", "replace")):
+            # unknown field names, but something in here is a Bambu serial
+            yield path, blob
+
+
+def _scan_text(blob, out):
+    """A store that is not JSON — an INI, a plain key/value list. Take the
+    fields around each serial and treat them as one record."""
+    text = blob.decode("utf-8", "replace")
+    pairs = {}
+    for line in text.splitlines():
+        for sep in ("=", ":"):
+            if sep in line:
+                key, _, value = line.partition(sep)
+                key, value = key.strip().strip('"').lower(), value.strip().strip('",')
+                if key and value:
+                    pairs.setdefault(key, value)
+                break
+    found = _record(pairs)
+    if found:
+        kept = out.setdefault(found["serial"], found)
+        for field in ("accessCode", "host", "name"):
+            if not kept.get(field) and found.get(field):
+                kept[field] = found[field]
 
 
 def slicer_printers():
@@ -424,7 +468,7 @@ def slicer_printers():
             try:
                 _walk(json.loads(blob.decode("utf-8-sig", "replace")), out)
             except (ValueError, RecursionError):
-                continue
+                _scan_text(blob, out)
     return list(out.values())
 
 
@@ -819,12 +863,6 @@ def _dump_walk(node, trail, rows, depth=0):
             _dump_walk(item, f"{trail}[{i}]", rows, depth + 1)
 
 
-# A Bambu serial always starts with one of the model prefixes, which makes it
-# findable in a file whose key names mean nothing to us.
-SERIAL_RE = re.compile(
-    r"\b(?:" + "|".join(SERIAL_MODELS) + r")[0-9A-Z]{9,17}\b")
-
-
 def deep_scan(root, limit=6000):
     """Any file at all holding something shaped like a Bambu serial.
 
@@ -838,17 +876,53 @@ def deep_scan(root, limit=6000):
         try:
             if not path.is_file() or path.stat().st_size > 4_000_000:
                 continue
-            if any(part.lower() in SKIP_PARTS
-                   for part in path.relative_to(root).parts):
-                continue
             blob = path.read_bytes()
         except OSError:
             continue
         seen += 1
         found = SERIAL_RE.findall(blob.decode("utf-8", "replace"))
         if found:
-            hits.append((path, sorted(set(found))[:4]))
+            hits.append((path, sorted(set(found))[:4], blob))
     return hits, seen
+
+
+def context_json(node, needles, trail="", out=None, depth=0):
+    """Where the serial sits in a parsed config, and what sits beside it."""
+    out = [] if out is None else out
+    if depth > 12 or len(out) > 12:
+        return out
+    if isinstance(node, dict):
+        for key, value in node.items():
+            here = f"{trail}.{key}" if trail else str(key)
+            hit_key = any(n in str(key) for n in needles)
+            hit_val = isinstance(value, (str, int, float)) and \
+                any(n in str(value) for n in needles)
+            if hit_key and isinstance(value, dict):
+                out.append((here, {k: show(k, v) for k, v in value.items()
+                                   if isinstance(v, (str, int, float))}))
+            elif hit_key or hit_val:
+                out.append((trail or "(root)",
+                            {k: show(k, v) for k, v in node.items()
+                             if isinstance(v, (str, int, float))}))
+            context_json(value, needles, here, out, depth + 1)
+    elif isinstance(node, list):
+        for i, item in enumerate(node[:40]):
+            context_json(item, needles, f"{trail}[{i}]", out, depth + 1)
+    return out
+
+
+def context_text(blob, needles):
+    """For a file that is not JSON: the bytes around the serial, with anything
+    code-shaped blanked out."""
+    text = blob.decode("utf-8", "replace")
+    out = []
+    for needle in needles[:2]:
+        at = text.find(needle)
+        if at < 0:
+            continue
+        window = text[max(0, at - 120):at + 160].replace("\n", " ")
+        out.append(re.sub(r"\b[0-9a-zA-Z]{8}\b", "********", window))
+    return out
 
 
 def cmd_dump(args):
@@ -889,10 +963,23 @@ def cmd_dump(args):
     for root in dirs:
         hits, seen = deep_scan(root)
         print(f"    {root}  ({seen} files read)")
-        for path, serials in hits:
+        for path, serials, blob in hits[:4]:
             anything = True
             print(f"      {path.relative_to(root)}: "
                   + ", ".join(s[:6] + "…" for s in serials))
+            try:
+                rows = context_json(json.loads(blob.decode("utf-8-sig", "replace")),
+                                    serials)
+            except ValueError:
+                rows = []
+            if rows:
+                for trail, fields in rows[:6]:
+                    shown = ", ".join(f"{k}={v}" for k, v in
+                                      list(fields.items())[:12])
+                    print(f"        {trail}: {shown}")
+            else:
+                for window in context_text(blob, serials):
+                    print(f"        …{window}…")
     if anything:
         print("\n  Those files know the printer. Send this output — the importer"
               "\n  can be taught to read them.")
