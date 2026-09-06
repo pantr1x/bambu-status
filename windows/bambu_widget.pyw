@@ -18,6 +18,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from tkinter import ttk
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -54,6 +55,12 @@ WIDGET_CONF = mon.DIR / "widget.json"
 
 
 # ------------------------------------------------------------------ colours
+# The applet is laid out in Kirigami units. Reusing them here — rather than
+# picking Windows-ish numbers — is what keeps the two UIs the same shape.
+GU = 18                    # Kirigami.Units.gridUnit at standard DPI
+SS = 4                     # Kirigami.Units.smallSpacing
+LS = 8                     # Kirigami.Units.largeSpacing
+
 KEY_COLOR = "#ff00ff"      # punched out of the window on Windows
 GREEN = "#00ae42"          # Bambu brand green
 AMBER = "#e0a458"
@@ -93,9 +100,11 @@ class Theme:
 
         self.text = "#ffffff" if self.dark else "#1b1b1b"
         self.dim = mix(self.text, self.bar_bg, 0.5)
-        self.panel_bg = "#1c1c1c" if self.dark else "#fbfbfb"
-        self.panel_line = mix(self.panel_bg, self.text, 0.16)
-        self.panel_text = "#f2f2f2" if self.dark else "#1b1b1b"
+        # Breeze, so the popup matches the Plasma applet rather than the OS
+        dialog = "#2a2e32" if self.dark else "#eff0f1"
+        self.panel_text = "#fcfcfc" if self.dark else "#232629"
+        self.panel_bg = mix(dialog, self.panel_text, 0.05)     # the card fill
+        self.panel_line = mix(self.panel_bg, self.panel_text, 0.09)
         self.panel_dim = mix(self.panel_text, self.panel_bg, 0.45)
 
         # How the chip sits on the taskbar. "blend" paints it in the taskbar's
@@ -112,7 +121,7 @@ class Theme:
         else:
             self.chip_bg = self.chip_line = self.bar_bg
 
-        self.track = mix(self.chip_bg, self.text, 0.22)
+        self.track = mix(self.chip_bg, self.text, 0.14)        # QML: white 14 %
         self.panel_track = mix(self.panel_bg, self.panel_text, 0.14)
 
 
@@ -188,6 +197,30 @@ def draw_logo(canvas, x, y, size, color=GREEN, gap=None, tags=()):
             pts += [x + (px_ - ox) / span * size, y + (py_ - oy) / span * size]
         canvas.create_polygon(pts, fill=color, outline=gap or color,
                               width=1 if gap else 0, tags=tags)
+
+
+def draw_glyph(c, kind, x, y, size, color):
+    """Pause / play / stop / repeat, drawn to stand in for the Kirigami icons
+    the applet uses."""
+    h = size
+    if kind == "pause":
+        w = size * 0.28
+        for dx in (0, size - w):
+            c.create_rectangle(x + dx, y, x + dx + w, y + h, fill=color, outline=color)
+    elif kind == "resume":
+        c.create_polygon(x, y, x, y + h, x + size * 0.92, y + h / 2,
+                         fill=color, outline=color)
+    elif kind == "stop":
+        c.create_rectangle(x, y, x + size, y + h, fill=color, outline=color)
+    elif kind == "reprint":
+        w = max(1, int(round(size * 0.16)))
+        c.create_arc(x, y, x + size, y + h, start=110, extent=280, style="arc",
+                     outline=color, width=w)
+        tip = size * 0.3
+        c.create_polygon(x + size * 0.5, y - tip * 0.15,
+                         x + size * 0.5 + tip, y + tip * 0.35,
+                         x + size * 0.5, y + tip * 0.85,
+                         fill=color, outline=color)
 
 
 def elide(text, font, maxw):
@@ -345,6 +378,140 @@ class MonitorHost:
             self.stop.set()
 
 
+# ------------------------------------------------------------------ setup
+class SetupDialog:
+    """Find the printer instead of making the user copy three fields by hand.
+
+    The address, serial and model come off the printer's own LAN broadcast; the
+    access code is a secret the printer only shows on its screen, so the best
+    that can be done is to look for one the Bambu slicer has already saved."""
+
+    def __init__(self, app):
+        self.app = app
+        self.found = []
+        self.win = win = tk.Toplevel(app.root)
+        win.title("Bambu Status — find my printer")
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self.close)
+
+        frm = ttk.Frame(win, padding=12)
+        frm.grid(sticky="nsew")
+        self.note = tk.StringVar(value="Looking for printers on the network…")
+        ttk.Label(frm, textvariable=self.note).grid(row=0, column=0, columnspan=2,
+                                                    sticky="w", pady=(0, 6))
+        self.list = tk.Listbox(frm, height=4, width=46, exportselection=False)
+        self.list.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.list.bind("<<ListboxSelect>>", self.pick)
+
+        self.host = tk.StringVar()
+        self.serial = tk.StringVar()
+        self.code = tk.StringVar()
+        for i, (label, var) in enumerate((("Address", self.host),
+                                          ("Serial", self.serial),
+                                          ("Access code", self.code))):
+            ttk.Label(frm, text=label).grid(row=2 + i, column=0, sticky="w",
+                                            pady=(8 if not i else 4, 0))
+            ttk.Entry(frm, textvariable=var, width=28).grid(
+                row=2 + i, column=1, sticky="ew", pady=(8 if not i else 4, 0))
+
+        ttk.Label(frm, foreground="#888888", wraplength=330,
+                  text="The access code is on the printer: Settings → WLAN. "
+                       "LAN mode has to be on.").grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        row = ttk.Frame(frm)
+        row.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        self.search_btn = ttk.Button(row, text="Search again", command=self.search)
+        self.search_btn.pack(side="left", padx=(0, 6))
+        ttk.Button(row, text="Cancel", command=self.close).pack(side="left", padx=(0, 6))
+        ttk.Button(row, text="Save", command=self.save).pack(side="left")
+
+        self.prefill()
+        win.update_idletasks()
+        win.geometry("+%d+%d" % (max(40, app.bar_x),
+                                 max(40, app.bar_y - win.winfo_height() - 20)))
+        self.search()
+
+    def prefill(self):
+        try:
+            conf = json.loads(CONF.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return
+        for key, var in (("host", self.host), ("serial", self.serial),
+                         ("accessCode", self.code)):
+            val = str(conf.get(key, ""))
+            if val and val not in mon.PLACEHOLDERS:
+                var.set(val)
+
+    def search(self):
+        self.search_btn.state(["disabled"])
+        self.note.set("Looking for printers on the network…")
+        self.list.delete(0, "end")
+        result = []
+        thread = threading.Thread(target=lambda: result.extend(mon.autodetect(6.0)),
+                                  daemon=True)
+        thread.start()
+
+        def poll():
+            if thread.is_alive():
+                self.win.after(300, poll)
+                return
+            self.found = result
+            self.search_btn.state(["!disabled"])
+            if not result:
+                self.note.set("Nothing announced itself. Type the details in by hand "
+                              "— printer screen: Settings → WLAN.")
+                return
+            self.note.set(f"Found {len(result)}. Pick one:")
+            for p in result:
+                label = f"{p['model']} · {p['host']} · {p['serial']}"
+                if p.get("name"):
+                    label = f"{p['model']} · {p['name']} · {p['host']}"
+                self.list.insert("end", label)
+            self.list.selection_set(0)
+            self.pick()
+
+        self.win.after(300, poll)
+
+    def pick(self, _event=None):
+        idx = self.list.curselection()
+        if not idx or idx[0] >= len(self.found):
+            return
+        p = self.found[idx[0]]
+        self.host.set(p["host"])
+        self.serial.set(p["serial"])
+        if p.get("accessCode"):
+            self.code.set(p["accessCode"])
+            self.note.set("Access code found in your Bambu slicer's settings.")
+
+    def save(self):
+        conf = {}
+        try:
+            conf = json.loads(CONF.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            pass
+        conf.update({"host": self.host.get().strip(),
+                     "serial": self.serial.get().strip(),
+                     "accessCode": self.code.get().strip()})
+        problem = mon.config_problem(conf)
+        if problem:
+            self.note.set(problem)
+            return
+        try:
+            CONF.parent.mkdir(parents=True, exist_ok=True)
+            CONF.write_text(json.dumps(conf, indent=2), encoding="utf-8")
+            os.chmod(CONF, 0o600)       # it holds a printer password
+        except OSError as e:
+            self.note.set(f"Could not write the config: {e}")
+            return
+        self.app.monitor.restart()
+        self.close()
+
+    def close(self):
+        self.app.setup = None
+        self.win.destroy()
+
+
 # ------------------------------------------------------------------ widget
 class BambuWidget:
     def __init__(self):
@@ -370,6 +537,8 @@ class BambuWidget:
         self.hover = None
         self.drag = None
         self.panel_closed_at = 0.0
+        self.setup = None
+        self.needs_setup = self.check_setup()
 
         self.build_bar()
         self.tick()
@@ -397,14 +566,23 @@ class BambuWidget:
     def px(self, n):
         return int(round(n * self.scale))
 
+    def u(self, units):
+        """Kirigami grid units to device pixels."""
+        return int(round(GU * units * self.scale))
+
     def make_fonts(self):
-        fam = "Segoe UI"
-        def f(size, weight="normal"):
-            return tkfont.Font(family=fam, size=size, weight=weight)
+        """QML sets font.pixelSize, so these are pixels too (Tk reads a
+        negative size as pixels) at the same multiples of the grid unit."""
+        fam = self.cfg.get("font") or "Segoe UI"
+
+        def f(units, weight="normal"):
+            return tkfont.Font(family=fam, size=-self.u(units), weight=weight)
+
         return {
-            "bar": f(9), "barBold": f(8, "bold"),
-            "h1": f(14, "bold"), "h2": f(10), "big": f(19, "bold"),
-            "body": f(10), "small": f(9), "btn": f(9, "bold"),
+            "bar": f(0.65), "barBold": f(0.62, "bold"), "stale": f(0.7, "bold"),
+            "h1": f(0.95, "bold"), "h2": f(0.7), "big": f(1.5, "bold"),
+            "body": f(0.85), "stat": f(0.75), "small": f(0.65),
+            "btn": f(0.68, "bold"),
         }
 
     # -------------------------------------------------------------- bar
@@ -434,36 +612,37 @@ class BambuWidget:
     def bar_height(self):
         tb = winui.taskbar()
         if tb["autohide"] or tb["h"] < self.px(16):
-            return self.px(34)
+            return self.u(1.9)
         if tb["edge"] in (winui.EDGE_TOP, winui.EDGE_BOTTOM):
-            return max(self.px(22), min(self.px(46), tb["h"] - self.px(6)))
-        return self.px(34)
+            return max(self.u(1.2), min(self.u(2.6), tb["h"] - self.px(6)))
+        return self.u(1.9)
 
     def bar_items(self):
         """What goes on the chip, measured, so the chip can be drawn first."""
         s, t, f = self.status, self.theme, self.fonts["bar"]
-        items = [("logo", None, self.px(15))]
+        items = [("logo", None, self.u(0.72))]
         head = s.model if s.connected else "offline"
         items.append(("text", (head, t.text if s.connected else t.dim),
                       f.measure(head)))
         if s.connected and s.printing and s.remaining > 0:
-            items.append(("text", ("·", mix(t.text, t.chip_bg, 0.6)), f.measure("·")))
+            items.append(("text", ("·", mix(t.text, t.chip_bg, 0.65)), f.measure("·")))
             eta = fmt_eta(s.remaining)
             items.append(("text", (eta, mix(t.text, t.chip_bg, 0.25)), f.measure(eta)))
         if s.connected and s.printing:
-            items.append(("pill", None, self.px(self.cfg.get("barWidth") or 100)))
+            items.append(("pill", None, self.px(self.cfg.get("barWidth") or 0)
+                          or self.u(7)))
         elif s.connected:
             items.append(("text", (s.label, mix(t.text, t.chip_bg, 0.3)),
                           f.measure(s.label)))
         # the monitor stamps every report; if it goes quiet the numbers lie
         if s.stale:
-            items.append(("stale", None, self.fonts["barBold"].measure("!")))
+            items.append(("stale", None, self.fonts["stale"].measure("!")))
         return items
 
     def draw_bar(self):
         c, s, t = self.bar_canvas, self.status, self.theme
         h = self.bar_height()
-        pad, gap = self.px(11), self.px(7)
+        pad, gap = self.px(LS) // 2, self.px(SS)
         items = self.bar_items()
         width = int(sum(i[2] for i in items) + gap * (len(items) - 1) + 2 * pad)
 
@@ -473,7 +652,7 @@ class BambuWidget:
             self.place_bar()
 
         c.delete("all")
-        chip_h = min(h - self.px(3), self.px(32))
+        chip_h = min(h - self.px(3), self.u(1.6))
         top, mid = (h - chip_h) / 2, h / 2
         bordered_rrect(c, 0, top, width, top + chip_h, self.px(8),
                        t.chip_bg, t.chip_line, width=max(1, self.px(1)))
@@ -490,9 +669,9 @@ class BambuWidget:
                               font=self.fonts["bar"], fill=color)
             elif kind == "stale":
                 c.create_text(x, mid, text="!", anchor="w",
-                              font=self.fonts["barBold"], fill=RED)
+                              font=self.fonts["stale"], fill=RED)
             elif kind == "pill":
-                bh = self.px(15)
+                bh = self.u(0.95)
                 y0 = mid - bh / 2
                 pill(c, x, y0, x + w, y0 + bh, t.track)
                 fw = max(bh, w * s.percent / 100.0)
@@ -615,6 +794,7 @@ class BambuWidget:
         m = tk.Menu(self.root, tearoff=0)
         m.add_command(label="Open panel", command=self.toggle_panel)
         m.add_separator()
+        m.add_command(label="Find my printer…", command=self.open_setup)
         m.add_command(label="Printer settings…", command=lambda: winui.open_file(CONF))
         m.add_command(label="Reload settings", command=self.reload)
         m.add_command(label="Restart monitor", command=self.monitor.restart)
@@ -641,6 +821,21 @@ class BambuWidget:
         self.cfg["offset"] = 12
         self.save_cfg()
         self.place_bar()
+
+    def check_setup(self):
+        """True while the config still has nothing usable in it."""
+        try:
+            conf = json.loads(CONF.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return True
+        return bool(mon.config_problem(conf))
+
+    def open_setup(self):
+        if self.setup:
+            self.setup.win.lift()
+            return
+        self.hide_panel()
+        self.setup = SetupDialog(self)
 
     def toggle_autostart(self):
         if not winui.set_autostart(self.autostart_var.get()):
@@ -698,7 +893,7 @@ class BambuWidget:
         self.panel_key = (KEY_COLOR if winui.transparent_key(self.panel, KEY_COLOR)
                           else self.theme.panel_bg)
         self.panel.configure(bg=self.panel_key)
-        self.panel_w = self.px(340)
+        self.panel_w = self.u(21)              # QML: gridUnit * 21
         self.panel_canvas = tk.Canvas(self.panel, highlightthickness=0, bd=0,
                                       bg=self.panel_key, width=self.panel_w)
         self.panel_canvas.pack(fill="both", expand=True)
@@ -733,38 +928,40 @@ class BambuWidget:
         c.delete("all")
         self.buttons = {}
         W = self.panel_w
-        pad = self.px(16)
+        pad = int(self.px(LS) * 1.2)           # QML: largeSpacing * 1.2
         y = pad
         if getattr(self, "panel_h", None):
             bordered_rrect(c, 0, 0, W, self.panel_h, self.px(12), t.panel_bg,
                            t.panel_line, width=max(1, self.px(1)))
 
         # ---- header
-        logo = self.px(26)
-        draw_logo(c, pad, y, logo, GREEN if s.connected else mix(GREEN, t.panel_bg, 0.5))
-        c.create_text(pad + logo + self.px(10), y - self.px(1), text=s.model,
-                      anchor="nw", font=self.fonts["h1"], fill=t.panel_text)
-        c.create_text(pad + logo + self.px(10), y + self.px(19),
-                      text=s.label if s.connected else "offline", anchor="nw",
-                      font=self.fonts["h2"],
+        logo = self.u(1.2)                     # iconSizes.smallMedium
+        draw_logo(c, pad, y, logo,
+                  GREEN if s.connected else mix(GREEN, t.panel_bg, 0.5),
+                  gap=t.panel_bg)
+        tx = pad + logo + self.px(SS)
+        c.create_text(tx, y - self.px(1), text=s.model, anchor="nw",
+                      font=self.fonts["h1"], fill=t.panel_text)
+        c.create_text(tx, y + self.u(0.95), text=s.label if s.connected else "offline",
+                      anchor="nw", font=self.fonts["h2"],
                       fill=s.accent if s.connected else t.panel_dim)
         if s.connected and s.printing:
-            c.create_text(W - pad, y + self.px(2), text=f"{s.percent}%", anchor="ne",
+            c.create_text(W - pad, y - self.px(2), text=f"{s.percent}%", anchor="ne",
                           font=self.fonts["big"], fill=s.accent)
-        y += logo + self.px(14)
+        y += max(logo, self.u(1.75)) + self.px(LS)
 
         # ---- job name
         if s.name:
             c.create_text(pad, y, text=elide(s.name, self.fonts["body"], W - 2 * pad),
                           anchor="nw", font=self.fonts["body"], fill=t.panel_text)
-            y += self.px(27)
+            y += self.u(1.0) + self.px(LS)
 
-        # ---- progress
+        # ---- progress and the numbers under it
         if s.connected:
-            bh = self.px(7)
+            bh = self.u(0.5)
             pill(c, pad, y, W - pad, y + bh, t.panel_track)
             pill(c, pad, y, pad + (W - 2 * pad) * s.percent / 100.0, y + bh, s.accent)
-            y += bh + self.px(16)
+            y += bh + self.px(LS)
 
             for key, val in (("Remaining", fmt_eta(s.remaining)),
                              ("Layer", f"{s.layer} / {s.total_layers}"
@@ -772,21 +969,21 @@ class BambuWidget:
                              ("Nozzle / bed",
                               f"{round(s.nozzle)}° / {round(s.bed)}°")):
                 c.create_text(pad, y, text=key, anchor="nw",
-                              font=self.fonts["body"], fill=t.panel_dim)
+                              font=self.fonts["stat"], fill=t.panel_dim)
                 c.create_text(W - pad, y, text=val, anchor="ne",
-                              font=self.fonts["body"], fill=t.panel_text)
-                y += self.px(21)
-            y += self.px(6)
+                              font=self.fonts["stat"], fill=t.panel_text)
+                y += self.u(0.75) + self.px(SS)
+            y += self.px(LS) - self.px(SS)
 
         # ---- camera
         if self.cfg.get("camera", True):
             cam_h = int((W - 2 * pad) * 0.52)
             self.draw_camera(c, pad, y, W - pad, y + cam_h)
-            y += cam_h + self.px(14)
+            y += cam_h + self.px(LS)
 
         # ---- controls
-        bh = self.px(30)
-        gap = self.px(7)
+        bh = self.u(1.75)
+        gap = self.px(SS)
         third = (W - 2 * pad - 2 * gap) / 3
         self.button(c, "pause", "Pause", AMBER, pad, y, pad + third, y + bh,
                     enabled=s.connected and s.state == "RUNNING")
@@ -799,18 +996,23 @@ class BambuWidget:
         self.button(c, "reprint", "Print again", BLUE, pad, y, W - pad, y + bh,
                     enabled=s.connected and not s.printing and bool(s.name),
                     confirm="Start print?")
-        y += bh + self.px(12)
+        y += bh + self.px(LS)
+
+        # ---- setup, when there is nothing to talk to yet
+        if self.needs_setup and not s.connected:
+            self.button(c, "setup", "Find my printer", BLUE, pad, y, W - pad, y + bh)
+            y += bh + self.px(LS)
 
         # ---- why it is offline, then the footer
         if not s.connected and s.error:
             for line in wrap(s.error, self.fonts["small"], W - 2 * pad):
                 c.create_text(pad, y, text=line, anchor="nw",
                               font=self.fonts["small"], fill=t.panel_dim)
-                y += self.px(15)
-            y += self.px(6)
+                y += self.u(0.85)
+            y += self.px(SS)
         c.create_text(pad, y, text="Settings", anchor="nw", font=self.fonts["small"],
                       fill=t.panel_dim, tags=("hit:settings",))
-        y += self.px(26)
+        y += self.u(0.65) + self.px(LS) * 1.2
 
         if getattr(self, "panel_h", None) != int(y):
             # the card needs the final height, so the first pass measures and
@@ -865,8 +1067,11 @@ class BambuWidget:
         cw, ch = min(sw, w * k), min(sh, h * k)
         x0, y0 = (sw - cw) // 2, (sh - ch) // 2
         dst = tk.PhotoImage(width=w, height=h, master=self.root)
+        # centre it: a source smaller than the frame would otherwise sit in the
+        # top left corner with the backdrop showing along two edges
+        to_x, to_y = max(0, (w - cw // k) // 2), max(0, (h - ch // k) // 2)
         dst.tk.call(dst, "copy", src, "-from", x0, y0, x0 + cw, y0 + ch,
-                    "-subsample", k, k, "-shrink")
+                    "-to", to_x, to_y, "-subsample", k, k)
         return dst
 
     def button(self, c, key, label, accent, x0, y0, x1, y1, enabled=True,
@@ -885,10 +1090,16 @@ class BambuWidget:
             fill = mix(t.panel_bg, accent, 0.28 if hovered else 0.14)
             border = mix(t.panel_bg, accent, 0.45)
             fg = accent
-        bordered_rrect(c, x0, y0, x1, y1, self.px(8), fill, border,
+        bordered_rrect(c, x0, y0, x1, y1, self.u(0.5), fill, border,
                        width=max(1, self.px(1)), tags=(f"hit:{key}",))
         text = confirm if (armed and confirm) else label
-        c.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=text, anchor="c",
+        icon = self.u(0.72) if key in ("pause", "resume", "stop", "reprint") else 0
+        space = self.px(SS) * 1.4 if icon else 0
+        tw = self.fonts["btn"].measure(text)
+        left = (x0 + x1) / 2 - (icon + space + tw) / 2
+        if icon:
+            draw_glyph(c, key, left, (y0 + y1) / 2 - icon / 2, icon, fg)
+        c.create_text(left + icon + space, (y0 + y1) / 2, text=text, anchor="w",
                       font=self.fonts["btn"], fill=fg, tags=(f"hit:{key}",))
         self.buttons[key] = {"box": (x0, y0, x1, y1), "enabled": enabled,
                              "confirm": bool(confirm)}
@@ -919,6 +1130,9 @@ class BambuWidget:
         if key == "settings":
             winui.open_file(CONF)
             return
+        if key == "setup":
+            self.open_setup()
+            return
         b = self.buttons.get(key)
         if not b or not b["enabled"]:
             return
@@ -934,6 +1148,7 @@ class BambuWidget:
     # -------------------------------------------------------------- loop
     def tick(self):
         self.status.poll()
+        self.needs_setup = self.check_setup()
         if self.armed and time.time() - self.armed_at > 5:
             self.armed = None
         self.draw_bar()

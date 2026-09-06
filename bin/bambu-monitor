@@ -233,6 +233,151 @@ def config_problem(conf):
     return None
 
 
+# ---------------------------------------------------------------- discovery
+# In LAN mode the printer broadcasts an SSDP NOTIFY every few seconds. It
+# carries the address, the serial and the model — everything except the access
+# code, which is a secret and only ever shown on the printer's own screen.
+SSDP_GROUP = "239.255.255.250"
+SSDP_PORTS = (2021, 1990)
+
+
+def parse_ssdp(text):
+    """Pull the bambu fields out of one NOTIFY datagram."""
+    if "bambulab" not in text.lower():
+        return None
+    head = {}
+    for line in text.splitlines()[1:]:
+        if ":" in line:
+            k, _, v = line.partition(":")
+            head[k.strip().lower()] = v.strip()
+    host = head.get("location", "")
+    serial = head.get("usn", "")
+    if not host or not serial:
+        return None
+    return {"host": host,
+            "serial": serial,
+            "name": head.get("devname.bambu.com", ""),
+            "model": model_from_serial(serial)}
+
+
+def discover(timeout=6.0):
+    """Listen for printers announcing themselves. Returns a list, newest last."""
+    socks = []
+    for port in SSDP_PORTS:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("", port))
+        except OSError:
+            s.close()
+            continue
+        try:                            # listen to the group as well as broadcast
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                         socket.inet_aton(SSDP_GROUP) + socket.inet_aton("0.0.0.0"))
+        except OSError:
+            pass
+        s.settimeout(0.5)
+        socks.append(s)
+    if not socks:
+        return []
+
+    # most firmware answers an M-SEARCH, and all of it announces unprompted
+    probe = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1990\r\n"
+             'MAN: "ssdp:discover"\r\nMX: 1\r\n'
+             "ST: urn:bambulab-com:device:3dprinter:1\r\n\r\n").encode()
+    for s in socks:
+        try:
+            s.sendto(probe, (SSDP_GROUP, 1990))
+        except OSError:
+            pass
+
+    found = {}
+    end = time.time() + timeout
+    while time.time() < end:
+        for s in socks:
+            try:
+                data, addr = s.recvfrom(4096)
+            except (socket.timeout, OSError):
+                continue
+            info = parse_ssdp(data.decode("utf-8", "replace"))
+            if info:
+                # the datagram's own source address beats a Location header
+                # that some firmware fills in with a stale lease
+                info.setdefault("host", addr[0])
+                found[info["serial"]] = info
+    for s in socks:
+        s.close()
+    return list(found.values())
+
+
+# Bambu Studio and OrcaSlicer keep the access code for every printer they have
+# talked to. The layout of those files has changed between releases, so rather
+# than pin one schema this walks the config tree and picks out anything that
+# looks like an access code next to a device id.
+SLICER_DIRS = ("BambuStudio", "OrcaSlicer", "BambuNetworkEngine")
+CODE_KEYS = ("access_code", "accesscode", "dev_access_code", "printer_access_code")
+ID_KEYS = ("dev_id", "device_id", "serial", "sn", "usn", "printer_sn")
+
+
+def slicer_config_dirs():
+    homes = []
+    if os.name == "nt":
+        for var in ("APPDATA", "LOCALAPPDATA"):
+            base = os.environ.get(var)
+            if base:
+                homes.append(Path(base))
+    else:
+        homes += [Path.home() / ".config", Path.home()]
+    return [h / name for h in homes for name in SLICER_DIRS if (h / name).is_dir()]
+
+
+def looks_like_serial(key):
+    """Some layouts key printers by serial rather than naming the field."""
+    k = str(key)
+    return (10 <= len(k) <= 24 and k.isalnum() and k == k.upper()
+            and any(c.isdigit() for c in k) and any(c.isalpha() for c in k))
+
+
+def _harvest(node, out, serial=None):
+    """Walk parsed JSON collecting {serial or None: access code}."""
+    if isinstance(node, dict):
+        lowered = {str(k).lower(): v for k, v in node.items()}
+        code = next((str(lowered[k]) for k in CODE_KEYS
+                     if isinstance(lowered.get(k), (str, int))), None)
+        here = next((str(lowered[k]) for k in ID_KEYS
+                     if isinstance(lowered.get(k), (str, int))), serial)
+        if code and code.strip():
+            out.setdefault(here, code.strip())
+        for key, value in node.items():
+            _harvest(value, out, key if looks_like_serial(key) else here)
+    elif isinstance(node, list):
+        for item in node:
+            _harvest(item, out, serial)
+
+
+def slicer_access_codes(limit_bytes=2_000_000):
+    """{serial or None: access code} found in the installed slicer's config."""
+    out = {}
+    for root in slicer_config_dirs():
+        for path in list(root.rglob("*.json")) + list(root.rglob("*.conf")):
+            try:
+                if path.stat().st_size > limit_bytes:
+                    continue
+                _harvest(json.loads(path.read_text(encoding="utf-8-sig")), out)
+            except (OSError, ValueError, RecursionError):
+                continue
+    return out
+
+
+def autodetect(timeout=6.0):
+    """Everything needed for a config, as far as it can be worked out alone."""
+    printers = discover(timeout)
+    codes = slicer_access_codes()
+    for p in printers:
+        p["accessCode"] = codes.get(p["serial"]) or ""
+    return printers
+
+
 def run_once(conf, stop=None):
     host = conf["host"]
     serial = conf["serial"]

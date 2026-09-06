@@ -72,8 +72,17 @@ That copies the widget to `%LOCALAPPDATA%\Programs\BambuStatus`, adds a start
 menu entry, starts it at logon, and launches it. Nothing needs admin rights and
 nothing is written outside your profile.
 
-Put your printer details in `%APPDATA%\BambuStatus\config.json` — same three
-keys as above — then right click the widget → *Reload settings*.
+Then let it find the printer for you: right click the widget → **Find my
+printer…**, or click *Find my printer* in the panel. In LAN mode the printer
+broadcasts its address, serial and model over SSDP, and the access code is
+looked up in Bambu Studio's or OrcaSlicer's saved settings if either has ever
+talked to it. Windows will ask whether Python may listen on your private
+network the first time — say yes, that is the discovery listening for the
+broadcast.
+
+Anything it cannot work out you can type in the same window, or edit
+`%APPDATA%\BambuStatus\config.json` by hand — same three keys as above — and
+right click → *Reload settings*.
 
 The widget docks itself to the **left end of the taskbar**. From there:
 
@@ -81,8 +90,8 @@ The widget docks itself to the **left end of the taskbar**. From there:
 - **drag** — move it. Drop it anywhere on the taskbar to re-dock (it remembers
   which end and how far along); drop it off the taskbar and it floats there
   instead
-- **right click** — printer settings, reload, restart the monitor, start with
-  Windows on or off, dock left / right, quit
+- **right click** — find my printer, printer settings, reload, restart the
+  monitor, start with Windows on or off, dock left / right, quit
 
 There is no separate service on Windows: the widget runs the LAN monitor on a
 background thread, and drops it if another copy of the monitor already holds
@@ -138,6 +147,12 @@ than guessed from the registry — translucency and the wallpaper decide what th
 bar actually looks like — so only the logo and the numbers show, with no box
 around them.
 
+The popup is laid out in the same Kirigami units as the Plasma applet
+(`gridUnit`, `smallSpacing`, `largeSpacing`) with Breeze's colours, so the two
+are the same window on both systems rather than two designs that happen to show
+the same numbers. The icons are drawn by hand, Windows having no Kirigami
+theme to borrow them from.
+
 The Windows widget is drawn by hand on a tkinter canvas — Windows has no
 supported way to put a control inside the taskbar (deskbands are gone), so it
 is a borderless always-on-top strip that keeps itself parked on the taskbar and
@@ -151,14 +166,15 @@ camera stream on 6000, speaking enough of both to drive the real monitor, and
 recording every command it is sent.
 
 ```bash
-python3 tests/test_live.py        # needs tkinter, a display, and openssl
-xvfb-run -a python3 tests/test_live.py
+xvfb-run -a python3 tests/test_live.py    # the whole chain, needs openssl
+xvfb-run -a python3 tests/test_setup.py   # the find-my-printer dialog
+python3 tests/test_discovery.py           # SSDP and the slicer config scan
 ```
 
-It runs the actual widget against it and checks the whole chain: the printer's
-reports reaching the bar and the panel, camera frames arriving, and every
-button — including that `Stop` sends nothing on the first click and that
-`Print again` rebuilds the right 3mf path.
+`test_live.py` runs the actual widget against the fake printer and checks the
+whole chain: the printer's reports reaching the bar and the panel, camera frames
+arriving, and every button — including that `Stop` sends nothing on the first
+click and that `Print again` rebuilds the right 3mf path.
 
 ## Safety
 
