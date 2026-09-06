@@ -383,18 +383,46 @@ def _walk(node, out, key_serial=None):
             _walk(item, out, key_serial)
 
 
-def slicer_printers(limit_bytes=4_000_000):
+# a slicer install is mostly vendor presets and an embedded browser's cache;
+# neither has ever held a device record, and there are thousands of them
+SKIP_PARTS = {"webview2cache", "cache", "caches", "logs", "log", "crashreports",
+              "temp", "tmp", "gcodes", "shapes", "resources", "profiles"}
+# cheap pre-filter: a file with none of these bytes cannot hold a device record
+MARKERS = (b"access_code", b"accesscode", b"dev_id", b"dev_ip", b"dev_name",
+           b"printer_sn", b"device_id")
+
+
+def slicer_files(root, limit_bytes=4_000_000, limit=1200):
+    seen = 0
+    for path in sorted(root.rglob("*")):
+        if seen >= limit:
+            return
+        # only the parts below the slicer directory: the path above it belongs
+        # to the user and may well contain a word like "tmp"
+        if any(part.lower() in SKIP_PARTS for part in path.relative_to(root).parts):
+            continue
+        if path.suffix.lower() not in (".json", ".conf", ".cfg"):
+            continue
+        try:
+            if not path.is_file() or path.stat().st_size > limit_bytes:
+                continue
+            blob = path.read_bytes()
+        except OSError:
+            continue
+        seen += 1
+        low = blob.lower()
+        if any(m in low for m in MARKERS):
+            yield path, blob
+
+
+def slicer_printers():
     """Printers the installed slicer has saved, no network involved."""
     out = {}
     for root in slicer_config_dirs():
-        for path in sorted(root.rglob("*")):
-            if path.suffix.lower() not in (".json", ".conf", ".cfg") or not path.is_file():
-                continue
+        for path, blob in slicer_files(root):
             try:
-                if path.stat().st_size > limit_bytes:
-                    continue
-                _walk(json.loads(path.read_text(encoding="utf-8-sig")), out)
-            except (OSError, ValueError, RecursionError):
+                _walk(json.loads(blob.decode("utf-8-sig", "replace")), out)
+            except (ValueError, RecursionError):
                 continue
     return list(out.values())
 
@@ -755,6 +783,77 @@ def probe(host, code, timeout=6):
     return out
 
 
+def looks_secret(key):
+    k = str(key).lower()
+    return any(w in k for w in ("code", "password", "passwd", "token", "secret",
+                                "key", "auth"))
+
+
+def show(key, value):
+    """Values are printed to be pasted into a bug report, so anything that
+    could be a credential is reduced to its shape."""
+    text = str(value)
+    if looks_secret(key):
+        return mask(text)
+    if looks_like_serial(text):
+        return text[:6] + "…" + f" ({len(text)} chars)"
+    return text[:48] + ("…" if len(text) > 48 else "")
+
+
+def _dump_walk(node, trail, rows, depth=0):
+    if depth > 12 or len(rows) > 120:
+        return
+    if isinstance(node, dict):
+        flat = {str(k).lower(): v for k, v in node.items()}
+        # a dict is worth showing if it names a device or holds an access code
+        notable = any(k in flat for k in CODE_KEYS + ID_KEYS + IP_KEYS + NAME_KEYS)
+        if notable:
+            fields = {k: show(k, v) for k, v in node.items()
+                      if isinstance(v, (str, int, float))}
+            rows.append((trail or "(root)", fields))
+        for key, value in node.items():
+            _dump_walk(value, f"{trail}.{key}" if trail else str(key), rows, depth + 1)
+    elif isinstance(node, list):
+        for i, item in enumerate(node[:20]):
+            _dump_walk(item, f"{trail}[{i}]", rows, depth + 1)
+
+
+def cmd_dump(args):
+    """--dump-slicer: show how this machine's slicer stores its printers.
+
+    Every version has arranged these files differently, so when the importer
+    comes up empty this is what says why. Credentials are masked."""
+    print("Bambu Status — slicer config dump\n")
+    dirs = slicer_config_dirs()
+    if not dirs:
+        print("  no Bambu Studio or OrcaSlicer directory for this user")
+        return 1
+    total = 0
+    for root in dirs:
+        print(f"  {root}")
+        for path, blob in slicer_files(root):
+            try:
+                data = json.loads(blob.decode("utf-8-sig", "replace"))
+            except ValueError:
+                continue
+            rows = []
+            _dump_walk(data, "", rows)
+            if not rows:
+                continue
+            total += 1
+            print(f"    {path.relative_to(root)}")
+            if isinstance(data, dict):
+                print(f"      top-level keys: {', '.join(list(data)[:12])}")
+            for trail, fields in rows[:8]:
+                shown = ", ".join(f"{k}={v}" for k, v in list(fields.items())[:10])
+                print(f"      {trail}: {shown}")
+    if not total:
+        print("\n  Nothing in there names a printer by address or access code.")
+        print("  That usually means the slicer only ever reached the printer")
+        print("  through the Bambu cloud, which keeps no LAN credentials.")
+    return 0
+
+
 def cmd_doctor(args):
     """--doctor: say exactly where the chain breaks."""
     print("Bambu Status — doctor")
@@ -778,25 +877,14 @@ def cmd_doctor(args):
     dirs = slicer_config_dirs()
     if not dirs:
         print("    no slicer config directory found for this user")
-    interesting = CODE_KEYS + ID_KEYS + IP_KEYS
     for root in dirs:
-        files = [f for f in root.rglob("*")
-                 if f.is_file() and f.suffix.lower() in (".json", ".conf", ".cfg")]
-        print(f"    {root}  ({len(files)} config files)")
-        hits = []
-        for f in files:
-            try:
-                if f.stat().st_size > 4_000_000:
-                    continue
-                text = f.read_text(encoding="utf-8-sig", errors="replace").lower()
-            except OSError:
-                continue
-            if any(k in text for k in interesting):
-                hits.append(str(f.relative_to(root)))
+        hits = [str(f.relative_to(root)) for f, _ in slicer_files(root)]
+        print(f"    {root}")
         if hits:
-            print(f"      {len(hits)} mention a printer, e.g. " + ", ".join(hits[:6]))
+            print(f"      {len(hits)} file(s) hold device fields, e.g. "
+                  + ", ".join(hits[:6]))
         else:
-            print("      none mention an address, serial or access code")
+            print("      no file holds an address, serial or access code")
 
     printers = slicer_printers()
     print(f"    printers read out of them: {len(printers)}")
@@ -901,10 +989,13 @@ def main():
     if "--help" in args or "-h" in args:
         print(__doc__.strip())
         print("\n  --doctor [--offline]     say where the connection breaks"
+              "\n  --dump-slicer            show how the slicer stores its printers"
               "\n  --detect [--offline]     list printers this machine knows of"
               "\n  --setup [n] [--offline]  write the config from one of them"
               "\n  (no arguments)           run the monitor")
         return 0
+    if "--dump-slicer" in args:
+        return cmd_dump(args)
     if "--doctor" in args:
         return cmd_doctor(args)
     if "--detect" in args:

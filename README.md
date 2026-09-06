@@ -208,7 +208,11 @@ bambu-monitor --doctor            # Linux
 & "$env:LOCALAPPDATA\Programs\BambuStatus\..." --doctor   # Windows, see below
 ```
 
-It walks the whole chain and says which link is broken: what is in the config,
+`--dump-slicer` goes with it: it prints how the installed slicer has arranged
+its own config, which is what to send along if the import found nothing.
+Credentials are masked in both.
+
+`--doctor` walks the whole chain and says which link is broken: what is in the config,
 which slicer directories were searched and what came out of them, what
 announced itself on the network, and then the connection itself — TCP, TLS,
 MQTT login — one line each. A refused socket is a wrong address or LAN mode
