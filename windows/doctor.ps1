@@ -30,24 +30,16 @@ if (-not $monitor) {
     exit 1
 }
 
-function Find-Python {
-    $candidates = New-Object System.Collections.Generic.List[string]
-    if (Get-Command py -ErrorAction SilentlyContinue) {
-        $exe = & py -3 -c "import sys; print(sys.executable)" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $exe) { $candidates.Add($exe.Trim()) }
-    }
-    foreach ($name in @("python", "python3")) {
-        $cmd = Get-Command $name -ErrorAction SilentlyContinue
-        if ($cmd -and $cmd.Source -notlike "*\WindowsApps\*") { $candidates.Add($cmd.Source) }
-    }
-    foreach ($exe in $candidates) {
-        & $exe -c "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)" 2>$null
-        if ($LASTEXITCODE -eq 0) { return $exe }
-    }
-    return $null
+$common = Join-Path $src "common.ps1"
+if (-not (Test-Path $common)) {
+    Write-Host "Missing $common - this clone is incomplete." -ForegroundColor Red
+    Write-Host "Run 'git pull' in the repository and try again."
+    exit 1
 }
+. $common
 
-$python = Find-Python
+# the reports draw nothing, so a python without tkinter will do
+$python = Find-Python -NoTk
 if (-not $python) {
     Write-Host "No usable Python found - install 3.9 or newer from python.org." -ForegroundColor Red
     exit 1

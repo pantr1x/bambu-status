@@ -119,6 +119,28 @@ There is no separate service on Windows: the widget runs the LAN monitor on a
 background thread, and drops it if another copy of the monitor already holds
 the lock.
 
+### Upgrading
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\windows\upgrade.ps1
+```
+
+Pulls the repository, reinstalls, restarts the widget — and then waits for the
+monitor to say it has actually reached the printer, rather than calling it done
+because files were copied. If it has not connected within 25 seconds it runs
+the diagnostics itself and prints the report.
+
+It refuses to run over uncommitted changes instead of overwriting them, and
+never touches `config.json`. `-Branch <name>` updates from somewhere other than
+`main`, `-NoVerify` skips the wait, `-Wait <seconds>` changes it.
+
+On Linux it is the ordinary three:
+
+```bash
+git pull && ./install.sh && systemctl --user restart bambu-monitor
+~/.local/bin/bambu-monitor --verify     # did that work?
+```
+
 ### Optional config
 
 `config.json` — the printer:
@@ -256,6 +278,11 @@ to.
 `--dump-slicer` goes with it: it prints how the installed slicer has arranged
 its own config, which is what to send along if the import found nothing.
 Credentials are masked in both.
+
+`--verify [seconds]` is the short version of the question: it waits for the
+monitor to write a live report and then says what it connected to and how, or
+what is missing, and exits non-zero when it never got there — which is what
+`upgrade.ps1` branches on.
 
 `--doctor` walks the whole chain and says which link is broken: what is in the config,
 which slicer directories were searched and what came out of them, what

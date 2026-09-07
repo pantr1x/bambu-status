@@ -22,25 +22,13 @@ $dest    = Join-Path $env:LOCALAPPDATA "Programs\BambuStatus"
 $confDir = Join-Path $env:APPDATA "BambuStatus"
 $conf    = Join-Path $confDir "config.json"
 
-function Find-Python {
-    # tkinter ships with the python.org installer but can be left out of some
-    # builds, so test for it rather than trusting the first python on PATH
-    $candidates = New-Object System.Collections.Generic.List[string]
-    if (Get-Command py -ErrorAction SilentlyContinue) {
-        $exe = & py -3 -c "import sys; print(sys.executable)" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $exe) { $candidates.Add($exe.Trim()) }
-    }
-    foreach ($name in @("python", "python3")) {
-        $cmd = Get-Command $name -ErrorAction SilentlyContinue
-        # the Store stub on PATH is not an interpreter, it is an advert
-        if ($cmd -and $cmd.Source -notlike "*\WindowsApps\*") { $candidates.Add($cmd.Source) }
-    }
-    foreach ($exe in $candidates) {
-        & $exe -c "import sys, tkinter; sys.exit(0 if sys.version_info >= (3, 9) else 1)" 2>$null
-        if ($LASTEXITCODE -eq 0) { return $exe }
-    }
-    return $null
+$common = Join-Path $src "common.ps1"
+if (-not (Test-Path $common)) {
+    Write-Host "Missing $common - this clone is incomplete." -ForegroundColor Red
+    Write-Host "Run 'git pull' in the repository and try again."
+    exit 1
 }
+. $common
 
 $python = Find-Python
 if (-not $python) {
@@ -102,9 +90,7 @@ if (-not $NoAutostart) {
 }
 
 if (-not $NoStart) {
-    Get-CimInstance Win32_Process -Filter "Name = 'pythonw.exe' OR Name = 'python.exe'" |
-        Where-Object { $_.CommandLine -like "*bambu_widget.pyw*" } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+    Stop-Widget
     Start-Process -FilePath $pythonw -ArgumentList "`"$widget`"" -WorkingDirectory $dest
     Write-Host "==> started"
 }
