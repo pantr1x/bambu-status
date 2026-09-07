@@ -66,6 +66,10 @@ LOCK = DIR / ".bambu-monitor.lock"
 PORT = 8883
 CAM_PORT = 6000
 KEEPALIVE = 60
+# A connection that has gone quiet still looks connected from the outside, so
+# both the UI and --verify judge the last report by its age rather than by the
+# socket. One number, read from here by everything that needs it.
+STALE_AFTER = 90
 
 # only these may be sent to the printer; anything else in the command file is
 # ignored rather than forwarded
@@ -1548,6 +1552,62 @@ def cmd_doctor(args):
     return 0
 
 
+def cmd_verify(args):
+    """--verify [seconds]: wait for the monitor to say it is connected.
+
+    The question after an install is "did that work", and the honest answer is
+    in the status file the monitor writes. This waits for it rather than
+    reading it once, because a monitor that has just started has not connected
+    yet, and returns an exit code so a script can act on the answer."""
+    wait = next((int(a) for a in args if a.isdigit()), 25)
+    deadline = time.time() + wait
+    while True:
+        try:
+            state = json.loads(OUT.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            state = None
+        if state and state.get("connected") \
+                and time.time() - (state.get("updated") or 0) <= STALE_AFTER:
+            where = "your Bambu account" if state.get("mode") == "cloud" else "the LAN"
+            job = state.get("name") or ""
+            told = [state.get("model") or "printer", state.get("label") or "—"]
+            if state.get("printing"):
+                told.append(f"{state.get('percent', 0)}%")
+                if state.get("remainingMin"):
+                    told.append(f"{state['remainingMin']} min left")
+            if job:
+                told.append(f"“{job}”")
+            print("connected over " + where + ": " + " · ".join(told))
+            return 0
+        if time.time() >= deadline:
+            break
+        time.sleep(1.0)
+
+    # not connected: say which link is missing, in the order it would break
+    print("not connected.")
+    conf = {}
+    if CONF.exists():
+        try:
+            conf = json.loads(CONF.read_text(encoding="utf-8-sig"))
+        except ValueError as e:
+            print(f"  the config is unreadable: {e}")
+            return 1
+    problem = config_problem(conf)
+    if problem:
+        print(f"  {problem}")
+    elif state is None:
+        print(f"  {OUT} does not exist — the monitor has never run")
+    elif state.get("error"):
+        print(f"  {state['error']}")
+    elif not state.get("connected"):
+        print("  the monitor is running but has not reached the printer")
+    else:
+        age = int(time.time() - (state.get("updated") or 0))
+        print(f"  the last report is {age} s old — the connection has gone quiet")
+    print("  run --doctor for the whole chain")
+    return 1
+
+
 def describe(printers):
     for i, p in enumerate(printers, 1):
         print(f"  {i}. {p['model']:>8}  {p['host'] or 'address unknown':<15} "
@@ -1612,6 +1672,7 @@ def main():
     if "--help" in args or "-h" in args:
         print(__doc__.strip())
         print("\n  --doctor [--offline]     say where the connection breaks"
+              "\n  --verify [seconds]       wait for it to connect, and say so"
               "\n  --dump-slicer            show how the slicer stores its printers"
               "\n  --detect [--offline]     list printers this machine knows of"
               "\n  --setup [n] [--offline]  write the config from one of them"
@@ -1621,6 +1682,8 @@ def main():
         return cmd_dump(args)
     if "--doctor" in args:
         return cmd_doctor(args)
+    if "--verify" in args:
+        return cmd_verify(args)
     if "--detect" in args:
         return cmd_detect(args)
     if "--setup" in args:

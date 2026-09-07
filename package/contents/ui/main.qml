@@ -33,6 +33,8 @@ PlasmoidItem {
     property double clock: Date.now() / 1000
     readonly property string homeDir: Platform.StandardPaths
         .writableLocation(Platform.StandardPaths.HomeLocation).toString().replace("file://", "")
+    // 90 s mirrors STALE_AFTER in bin/bambu-monitor; QML cannot read the
+    // monitor's constant, so change both or neither
     readonly property bool stale: connected && updated > 0 && (clock - updated) > 90
 
     readonly property color barColor: state_ === "FAILED" ? failed

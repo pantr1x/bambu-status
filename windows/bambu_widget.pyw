@@ -321,7 +321,8 @@ class Status:
     @property
     def stale(self):
         up = self.data.get("updated") or 0
-        return bool(self.connected and up and time.time() - up > 90)
+        return bool(self.connected and up
+                    and time.time() - up > mon.STALE_AFTER)
 
     @property
     def accent(self):
