@@ -75,8 +75,12 @@ try {
 }
 
 # ------------------------------------------------------------------ install
-# install.ps1 stops the running widget and starts the new one itself
+# install.ps1 restarts the widget itself, but it copies the new files first and
+# a widget still holding the old ones is the one case this script exists for:
+# close it before anything is written over, not after
 Write-Host ""
+Write-Host "==> closing the running widget"
+Stop-Widget
 & (Join-Path $src "install.ps1")
 if ($LASTEXITCODE -ne 0 -and $null -ne $LASTEXITCODE) {
     Write-Host "install.ps1 did not finish." -ForegroundColor Red
