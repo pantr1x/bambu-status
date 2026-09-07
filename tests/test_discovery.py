@@ -94,6 +94,28 @@ check("a store that is not JSON still reads",
       odd_found.get("00M09A123456789", {}).get("host") == "192.168.0.77", odd_found)
 os.environ["HOME"] = str(home)
 
+# --- a stock Bambu Studio install carries thousands of vendor presets under
+# system/, which sorts before user/: reading in name order used to spend the
+# whole file budget on filament profiles and never reach the saved printer
+big = pathlib.Path(tempfile.mkdtemp(prefix="bighome-"))
+library = big / ".config" / "BambuStudio" / "system" / "BBL" / "filament"
+library.mkdir(parents=True)
+for i in range(1300):
+    (library / f"Bambu PLA {i:04d} @BBL X1C.json").write_text(json.dumps(
+        {"type": "filament", "name": f"PLA {i}", "filament_id": f"GFA{i:04d}"}))
+machine = big / ".config" / "BambuStudio" / "user" / "42" / "machine"
+machine.mkdir(parents=True)
+(machine / "printer.json").write_text(json.dumps(
+    {"dev_id": "01P00C612903019", "dev_ip": "192.168.0.102",
+     "access_code": "87654321", "dev_name": "Dielna P1S"}))
+os.environ["HOME"] = str(big)
+buried = {p["serial"]: p for p in mon.slicer_printers()}
+check("the preset library does not hide the printer",
+      "01P00C612903019" in buried, list(buried))
+check("its access code still arrives",
+      buried.get("01P00C612903019", {}).get("accessCode") == "87654321")
+os.environ["HOME"] = str(home)
+
 # --- and it all works with no network at all
 offline = mon.autodetect(network=False)
 check("autodetect works offline", len(offline) == 2, offline)

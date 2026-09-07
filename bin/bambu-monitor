@@ -562,19 +562,41 @@ SKIP_PARTS = {"webview2cache", "cache", "caches", "logs", "log", "crashreports",
 # cheap pre-filter: a file with none of these bytes cannot hold a device record
 MARKERS = (b"access_code", b"accesscode", b"dev_id", b"dev_ip", b"dev_name",
            b"printer_sn", b"device_id")
+# The vendor preset library lives under these — several thousand files on a
+# stock Bambu Studio install, and not one of them has ever held a device
+# record. Left in name order they come before "user", so reading alphabetically
+# spends the whole budget on filament profiles and never reaches the printer
+# the user actually owns. Read last, and only a few hundred of them.
+LATE_PARTS = {"system", "vendor", "presets", "hints"}
 
 
-def slicer_files(root, limit_bytes=4_000_000, limit=1200):
-    seen = 0
-    for path in sorted(root.rglob("*")):
-        if seen >= limit:
-            return
+def _scan_order(rel):
+    """The user's own files first, the vendor library last."""
+    parts = [part.lower() for part in rel.parts]
+    return (any(part in LATE_PARTS for part in parts[:-1]),
+            len(parts), str(rel).lower())
+
+
+def slicer_files(root, limit_bytes=4_000_000, limit=1200, late_limit=400):
+    try:
         # only the parts below the slicer directory: the path above it belongs
         # to the user and may well contain a word like "tmp"
-        if any(part.lower() in SKIP_PARTS for part in path.relative_to(root).parts):
+        found = [(path.relative_to(root), path) for path in root.rglob("*")]
+    except OSError:
+        return
+    found.sort(key=lambda pair: _scan_order(pair[0]))
+    seen = late = 0
+    for rel, path in found:
+        if seen >= limit:
+            return
+        parts = [part.lower() for part in rel.parts]
+        if any(part in SKIP_PARTS for part in parts):
             continue
         if path.suffix.lower() not in ("", ".json", ".conf", ".cfg", ".ini",
                                        ".dat", ".txt", ".config"):
+            continue
+        deferred = any(part in LATE_PARTS for part in parts[:-1])
+        if deferred and late >= late_limit:
             continue
         try:
             if not path.is_file() or path.stat().st_size > limit_bytes:
@@ -583,6 +605,8 @@ def slicer_files(root, limit_bytes=4_000_000, limit=1200):
         except OSError:
             continue
         seen += 1
+        if deferred:
+            late += 1
         low = blob.lower()
         if any(m in low for m in MARKERS):
             yield path, blob
