@@ -113,7 +113,7 @@ The widget docks itself to the **left end of the taskbar**. From there:
   which end and how far along); drop it off the taskbar and it floats there
   instead
 - **right click** — find my printer, printer settings, reload, restart the
-  monitor, start with Windows on or off, dock left / right, quit
+  monitor, diagnostics, start with Windows on or off, dock left / right, quit
 
 There is no separate service on Windows: the widget runs the LAN monitor on a
 background thread, and drops it if another copy of the monitor already holds
@@ -162,7 +162,9 @@ the same topics, so only the socket differs:
   it has the right machine; the printers Bambu Studio or
   OrcaSlicer have saved (their config layout has changed between releases, so
   it walks the tree for anything that looks like a saved printer rather than
-  pinning a schema), plus whatever answers the SSDP broadcast on the LAN
+  pinning a schema, and reads the user's own files before the several thousand
+  vendor presets a stock install ships), plus whatever answers the SSDP
+  broadcast on the LAN
 
 Those three files live in `~/.cache` on Linux and `%LOCALAPPDATA%\BambuStatus`
 on Windows. The UI only reads them. It never holds the access code.
@@ -242,8 +244,14 @@ click and that `Print again` rebuilds the right 3mf path.
 bambu-monitor --doctor            # Linux
 ```
 ```powershell
-& "$env:LOCALAPPDATA\Programs\BambuStatus\..." --doctor   # Windows, see below
+powershell -ExecutionPolicy Bypass -File .\windows\doctor.ps1   # Windows
 ```
+
+Or without a terminal at all: right click the widget → **Diagnostics…**. It runs
+the same two reports and shows them in a window, with *Copy* and *Save to file*
+(`%LOCALAPPDATA%\BambuStatus\diagnostics.txt`). That is there because the
+widget runs under `pythonw.exe`, which has no console for `--doctor` to print
+to.
 
 `--dump-slicer` goes with it: it prints how the installed slicer has arranged
 its own config, which is what to send along if the import found nothing.

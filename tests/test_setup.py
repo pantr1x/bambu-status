@@ -3,7 +3,7 @@ write a config the monitor can actually use?
 
     python3 tests/test_setup.py      (needs tkinter and a display)
 """
-import importlib.machinery, importlib.util, json, os, pathlib, shutil, sys, tempfile
+import importlib.machinery, importlib.util, json, os, pathlib, shutil, sys, tempfile, time
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -113,6 +113,37 @@ def run():
     # and the monitor agrees the config is usable now
     check("monitor accepts the config", bw.mon.config_problem(conf) is None,
           bw.mon.config_problem(conf))
+
+    # --- diagnostics: the answer to "why can it not find my printer", for a
+    # user running under pythonw.exe, which has no console to print it to
+    body = bw.diagnostics_report(["--offline"])
+    check("it says where the config is", str(D / "config.json") in body)
+    check("it lists the slicer directories", str(studio) in body, body[:200])
+    check("it names the printer the slicer saved", "01P00C612903019" in body)
+    check("the access code is never printed", "87654321" not in body)
+    check("it is masked instead", "…" in body)
+
+    opened = []
+    bw.winui.open_file = lambda path: opened.append(path) or True
+    bw.diagnostics_report = lambda args=(): body      # no network from a test
+    app.open_diagnostics()
+    diag = app.diagnostics
+    check("diagnostics window opened", diag is not None and diag.win.winfo_exists())
+    for _ in range(60):                               # it runs on a thread
+        app.root.update()
+        if diag.body():
+            break
+        time.sleep(0.05)
+    check("the report reaches the window", diag.body().strip() == body.strip())
+    diag.save()
+    written = D / "diagnostics.txt"
+    check("saved where it can be attached to a bug report", written.exists())
+    check("the file holds the report", written.exists()
+          and "Bambu Status" in written.read_text(encoding="utf-8"))
+    check("and it is opened for the user", opened == [written], opened)
+    diag.close()
+    check("diagnostics window closed", app.diagnostics is None)
+
     app.quit()
 
 app.root.after(300, run)

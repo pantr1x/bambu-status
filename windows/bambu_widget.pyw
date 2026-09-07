@@ -9,8 +9,10 @@ Runs on the Python that ships from python.org: tkinter and ctypes only, no pip
 install. Start it with pythonw.exe so there is no console window.
 """
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -51,6 +53,7 @@ mon = load_monitor()
 STATE = mon.OUT
 FRAME = mon.FRAME
 CONF = mon.CONF
+DIR = mon.DIR
 WIDGET_CONF = mon.DIR / "widget.json"
 
 
@@ -622,6 +625,119 @@ class SetupDialog:
         self.win.destroy()
 
 
+# ------------------------------------------------------------------ diagnostics
+def diagnostics_report(args=()):
+    """--doctor and --dump-slicer, with their print() collected into a string."""
+    args = list(args)
+    out = io.StringIO()
+    for label, cmd in (("doctor", mon.cmd_doctor), ("dump", mon.cmd_dump)):
+        with contextlib.redirect_stdout(out):
+            try:
+                cmd(args)
+            except Exception as e:                           # noqa: BLE001
+                # a broken link in the chain is what this window is for; it
+                # must still show the half that did run
+                print(f"  ({label} stopped: {e.__class__.__name__}: {e})")
+        print(file=out)
+    return out.getvalue()
+
+
+class DiagnosticsWindow:
+    """--doctor and --dump-slicer, for a user who has no console.
+
+    On Linux the answer to "why does it not find my printer" is one command in
+    a terminal. Windows starts the widget under pythonw.exe, which has no
+    stdout at all, so the same answer has to be a window. Access codes and the
+    account token are masked by the monitor itself, which is what makes the
+    text safe to paste into a bug report."""
+
+    def __init__(self, app):
+        self.app = app
+        self.win = win = tk.Toplevel(app.root)
+        win.title("Bambu Status — diagnostics")
+        win.protocol("WM_DELETE_WINDOW", self.close)
+
+        frm = ttk.Frame(win, padding=12)
+        frm.grid(sticky="nsew")
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(0, weight=1)
+        frm.columnconfigure(0, weight=1)
+        frm.rowconfigure(1, weight=1)
+
+        self.note = tk.StringVar(value="Checking…")
+        ttk.Label(frm, textvariable=self.note).grid(row=0, column=0, sticky="w",
+                                                    pady=(0, 6))
+        box = ttk.Frame(frm)
+        box.grid(row=1, column=0, sticky="nsew")
+        box.columnconfigure(0, weight=1)
+        box.rowconfigure(0, weight=1)
+        self.text = tk.Text(box, width=94, height=26, wrap="none",
+                            font=("Consolas", 9))
+        self.text.grid(row=0, column=0, sticky="nsew")
+        bar = ttk.Scrollbar(box, orient="vertical", command=self.text.yview)
+        bar.grid(row=0, column=1, sticky="ns")
+        self.text.configure(yscrollcommand=bar.set)
+
+        row = ttk.Frame(frm)
+        row.grid(row=2, column=0, sticky="e", pady=(12, 0))
+        self.again_btn = ttk.Button(row, text="Run again", command=self.run)
+        self.again_btn.pack(side="left", padx=(0, 6))
+        ttk.Button(row, text="Copy", command=self.copy).pack(side="left", padx=(0, 6))
+        ttk.Button(row, text="Save to file", command=self.save).pack(side="left",
+                                                                     padx=(0, 6))
+        ttk.Button(row, text="Close", command=self.close).pack(side="left")
+
+        win.update_idletasks()
+        win.geometry("+%d+%d" % (max(40, app.bar_x), 60))
+        self.run()
+
+    def run(self):
+        self.again_btn.state(["disabled"])
+        self.note.set("Checking the config, the slicer and the printer…")
+        self.show("")
+        result = []
+        thread = threading.Thread(target=lambda: result.append(diagnostics_report()),
+                                  daemon=True)
+        thread.start()
+
+        def poll():
+            if thread.is_alive():
+                self.win.after(300, poll)
+                return
+            self.again_btn.state(["!disabled"])
+            self.show(result[0] if result else "nothing came back")
+            self.note.set("Access codes are masked, so this is safe to paste.")
+
+        self.win.after(300, poll)
+
+    def show(self, body):
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", body)
+
+    def body(self):
+        return self.text.get("1.0", "end-1c")
+
+    def copy(self):
+        self.win.clipboard_clear()
+        self.win.clipboard_append(self.body())
+        self.note.set("Copied to the clipboard.")
+
+    def save(self):
+        path = DIR / "diagnostics.txt"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(self.body(), encoding="utf-8")
+        except OSError as e:
+            self.note.set(f"Could not write it: {e}")
+            return
+        self.note.set(f"Written to {path}")
+        winui.open_file(path)
+
+    def close(self):
+        self.app.diagnostics = None
+        self.win.destroy()
+
+
 # ------------------------------------------------------------------ widget
 class BambuWidget:
     def __init__(self):
@@ -648,6 +764,7 @@ class BambuWidget:
         self.drag = None
         self.panel_closed_at = 0.0
         self.setup = None
+        self.diagnostics = None
         self.needs_setup = self.check_setup()
 
         self.build_bar()
@@ -908,6 +1025,7 @@ class BambuWidget:
         m.add_command(label="Printer settings…", command=lambda: winui.open_file(CONF))
         m.add_command(label="Reload settings", command=self.reload)
         m.add_command(label="Restart monitor", command=self.monitor.restart)
+        m.add_command(label="Diagnostics…", command=self.open_diagnostics)
         m.add_separator()
         self.autostart_var = tk.BooleanVar(value=winui.autostart_enabled())
         m.add_checkbutton(label="Start with Windows", variable=self.autostart_var,
@@ -946,6 +1064,13 @@ class BambuWidget:
             return
         self.hide_panel()
         self.setup = SetupDialog(self)
+
+    def open_diagnostics(self):
+        if self.diagnostics:
+            self.diagnostics.win.lift()
+            return
+        self.hide_panel()
+        self.diagnostics = DiagnosticsWindow(self)
 
     def toggle_autostart(self):
         if not winui.set_autostart(self.autostart_var.get()):
